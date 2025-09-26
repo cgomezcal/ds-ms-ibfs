@@ -1,18 +1,39 @@
 version: '3.9'
 services:
-  nodeA:
+  nodea:
     build: .
-    command: ["--id","A","--addr",":8081","--peers","http://nodeB:8082,http://nodeC:8083,http://nodeD:8084","--validators","A,B,C,D"]
+    command: ["--id","A","--addr",":8081","--peers","http://nodeb:8082,http://nodec:8083,http://noded:8084","--validators","A,B,C,D"]
     ports: ["8081:8081"]
-  nodeB:
+    environment:
+      - PEER_TOKEN=t
+      - LEADER_URL=http://nodea:8081
+      - IS_LEADER=true
+      # Demo dev key (do not use in prod)
+      - ETH_PRIVATE_KEY=0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0
+  nodeb:
     build: .
-    command: ["--id","B","--addr",":8082","--peers","http://nodeA:8081,http://nodeC:8083,http://nodeD:8084","--validators","A,B,C,D"]
+    command: ["--id","B","--addr",":8082","--peers","http://nodea:8081,http://nodec:8083,http://noded:8084","--validators","A,B,C,D"]
     ports: ["8082:8082"]
-  nodeC:
+    environment:
+      - PEER_TOKEN=t
+      - LEADER_URL=http://nodea:8081
+      - IS_LEADER=false
+      - ETH_PRIVATE_KEY=0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d
+  nodec:
     build: .
-    command: ["--id","C","--addr",":8083","--peers","http://nodeA:8081,http://nodeB:8082,http://nodeD:8084","--validators","A,B,C,D"]
+    command: ["--id","C","--addr",":8083","--peers","http://nodea:8081,http://nodeb:8082,http://noded:8084","--validators","A,B,C,D"]
     ports: ["8083:8083"]
-  nodeD:
+    environment:
+      - PEER_TOKEN=t
+      - LEADER_URL=http://nodea:8081
+      - IS_LEADER=false
+      - ETH_PRIVATE_KEY=0x8f2a559490b8d6e3d2b1016da0fbdc3f5b6b6f9bcd3d2e2c2a2b1a1a0a9a8a7a
+  noded:
     build: .
-    command: ["--id","D","--addr",":8084","--peers","http://nodeA:8081,http://nodeB:8082,http://nodeC:8083","--validators","A,B,C,D"]
+    command: ["--id","D","--addr",":8084","--peers","http://nodea:8081,http://nodeb:8082,http://nodec:8083","--validators","A,B,C,D"]
     ports: ["8084:8084"]
+    environment:
+      - PEER_TOKEN=t
+      - LEADER_URL=http://nodea:8081
+      - IS_LEADER=false
+      - ETH_PRIVATE_KEY=0x5c51f7b14a6b3c2e9d8a7f6e5d4c3b2a190817161514131211100f0e0d0c0b0a

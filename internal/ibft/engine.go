@@ -64,8 +64,9 @@ func (e *Engine) Propose(value string) (Message, error) {
 	if e.state != "idle" {
 		return Message{}, errors.New("round already in progress")
 	}
-	e.value = valueHash(value)
-	// Broadcast PrePrepare to peers
+	// Use the provided value as-is (expected to be a proposal hash already)
+	e.value = value
+	// Broadcast PrePrepare to peers carrying the value unchanged
 	pp := Message{Type: PrePrepare, Round: e.round, From: e.id, Value: e.value}
 	pp.Sig = signMessage(e.ks.Private(e.id), pp)
 	if e.broadcast != nil {

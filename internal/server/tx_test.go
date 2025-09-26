@@ -43,7 +43,7 @@ func TestTxAggregationLeaderQuorum(t *testing.T) {
 		}
 		posts = append(posts, collect{Data: data, Wallet: addr, Sig: sig})
 	}
-	// First two should be 202, third should be 200 and contain message
+	// Primeras dos 202, la tercera ahora es 202 (IBFT corre asíncronamente)
 	for i, pl := range posts {
 		b, _ := json.Marshal(pl)
 		req, _ := http.NewRequest(http.MethodPost, tsL.URL+"/v1/tx/collect", bytes.NewReader(b))
@@ -56,8 +56,8 @@ func TestTxAggregationLeaderQuorum(t *testing.T) {
 		if i < 2 && res.StatusCode != http.StatusAccepted {
 			t.Fatalf("expected 202 on %d, got %d", i, res.StatusCode)
 		}
-		if i == 2 && res.StatusCode != http.StatusOK {
-			t.Fatalf("expected 200 on third, got %d", res.StatusCode)
+		if i == 2 && res.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected 202 on third (IBFT), got %d", res.StatusCode)
 		}
 		res.Body.Close()
 	}

@@ -19,7 +19,11 @@ func main() {
 		n.SetAuthToken(tok)
 	}
 	if l := os.Getenv("LEADER_URL"); l != "" {
-		n.SetLeader(l, l == "http://localhost"+addr)
+		isLeader := false
+		if v := os.Getenv("IS_LEADER"); v == "true" || v == "1" {
+			isLeader = true
+		}
+		n.SetLeader(l, isLeader)
 	}
 	if pk := os.Getenv("ETH_PRIVATE_KEY"); pk != "" {
 		n.SetPrivateKey(pk)
