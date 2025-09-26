@@ -1,0 +1,18 @@
+version: '3.9'
+services:
+  nodeA:
+    build: .
+    command: ["--id","A","--addr",":8081","--peers","http://nodeB:8082,http://nodeC:8083,http://nodeD:8084","--validators","A,B,C,D"]
+    ports: ["8081:8081"]
+  nodeB:
+    build: .
+    command: ["--id","B","--addr",":8082","--peers","http://nodeA:8081,http://nodeC:8083,http://nodeD:8084","--validators","A,B,C,D"]
+    ports: ["8082:8082"]
+  nodeC:
+    build: .
+    command: ["--id","C","--addr",":8083","--peers","http://nodeA:8081,http://nodeB:8082,http://nodeD:8084","--validators","A,B,C,D"]
+    ports: ["8083:8083"]
+  nodeD:
+    build: .
+    command: ["--id","D","--addr",":8084","--peers","http://nodeA:8081,http://nodeB:8082,http://nodeC:8083","--validators","A,B,C,D"]
+    ports: ["8084:8084"]
