@@ -18,6 +18,7 @@ func TestTxAggregationLeaderQuorum(t *testing.T) {
 	leader.SetLeader("http://leader", true)
 	tsL := httptest.NewServer(leader.mux)
 	defer tsL.Close()
+	leader.SetLeader(tsL.URL, true)
 
 	data := "hello"
 	// three distinct dev keys
@@ -26,12 +27,21 @@ func TestTxAggregationLeaderQuorum(t *testing.T) {
 		"0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d",
 		"0x8f2a559490b8d6e3d2b1016da0fbdc3f5b6b6f9bcd3d2e2c2a2b1a1a0a9a8a7a",
 	}
+	leader.SetPrivateKey(keys[0])
+
 	type collect struct {
-		Data   string `json:"data"`
-		Wallet string `json:"public_wallet"`
-		Sig    string `json:"firma_content"`
+		Data     string             `json:"data"`
+		Wallet   string             `json:"public_wallet"`
+		Sig      string             `json:"firma_content"`
+		Proof    merkleProofPayload `json:"merkle_proof"`
+		ProofSig string             `json:"proof_sig"`
 	}
-	posts := make([]collect, 0, 3)
+	type signer struct {
+		collect
+		privHex string
+	}
+	signers := make([]signer, 0, len(keys))
+	wallets := make([]string, 0, len(keys))
 	for _, k := range keys {
 		priv, err := eth.ParsePrivateKey(k)
 		if err != nil {
@@ -41,11 +51,28 @@ func TestTxAggregationLeaderQuorum(t *testing.T) {
 		if err != nil {
 			t.Fatalf("sign: %v", err)
 		}
-		posts = append(posts, collect{Data: data, Wallet: addr, Sig: sig})
+		signers = append(signers, signer{collect: collect{Data: data, Wallet: addr, Sig: sig}, privHex: k})
+		wallets = append(wallets, addr)
+	}
+	stub := newMTMStub(t, wallets)
+	defer stub.Close()
+	leader.SetMTMBaseURL(stub.URL())
+	for i := range signers {
+		proof := stub.Proof(signers[i].Wallet)
+		priv, err := eth.ParsePrivateKey(signers[i].privHex)
+		if err != nil {
+			t.Fatalf("parse key for proof: %v", err)
+		}
+		sigProof, _, err := eth.SignPersonal(canonicalProofBytes(signers[i].Wallet, proof), priv)
+		if err != nil {
+			t.Fatalf("sign proof: %v", err)
+		}
+		signers[i].Proof = proof
+		signers[i].ProofSig = sigProof
 	}
 	// Primeras dos 202, la tercera ahora es 202 (IBFT corre asíncronamente)
-	for i, pl := range posts {
-		b, _ := json.Marshal(pl)
+	for i, pl := range signers {
+		b, _ := json.Marshal(pl.collect)
 		req, _ := http.NewRequest(http.MethodPost, tsL.URL+"/v1/tx/collect", bytes.NewReader(b))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer t")

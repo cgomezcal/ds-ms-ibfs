@@ -8,6 +8,8 @@ import (
     "net/http/httptest"
     "testing"
     "time"
+
+    "github.com/cgomezcal/ds-ms-ibfs/internal/eth"
 )
 
 // TestExecuteTransaction_IBFT ensures the final voting is performed via IBFT when threshold is reached.
@@ -21,6 +23,22 @@ func TestExecuteTransaction_IBFT(t *testing.T) {
     leader := NewNode("A", ":0", nil)
     nodeB := NewNode("B", ":0", nil)
     nodeC := NewNode("C", ":0", nil)
+
+    privA, err := eth.ParsePrivateKey(keyA)
+    if err != nil { t.Fatalf("parse A: %v", err) }
+    walletA := eth.AddressFromPrivate(privA)
+    privB, err := eth.ParsePrivateKey(keyB)
+    if err != nil { t.Fatalf("parse B: %v", err) }
+    walletB := eth.AddressFromPrivate(privB)
+    privC, err := eth.ParsePrivateKey(keyC)
+    if err != nil { t.Fatalf("parse C: %v", err) }
+    walletC := eth.AddressFromPrivate(privC)
+
+    stub := newMTMStub(t, []string{walletA, walletB, walletC})
+    defer stub.Close()
+    leader.SetMTMBaseURL(stub.URL())
+    nodeB.SetMTMBaseURL(stub.URL())
+    nodeC.SetMTMBaseURL(stub.URL())
 
     // auth
     leader.SetAuthToken("t")

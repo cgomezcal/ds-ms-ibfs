@@ -30,6 +30,22 @@ func TestTxVotingFlow(t *testing.T) {
     nodeB.SetAuthToken("t")
     nodeC.SetAuthToken("t")
 
+    privA, err := eth.ParsePrivateKey(keyA)
+    if err != nil { t.Fatalf("parse A: %v", err) }
+    walletA := eth.AddressFromPrivate(privA)
+    privB, err := eth.ParsePrivateKey(keyB)
+    if err != nil { t.Fatalf("parse B: %v", err) }
+    walletB := eth.AddressFromPrivate(privB)
+    privC, err := eth.ParsePrivateKey(keyC)
+    if err != nil { t.Fatalf("parse C: %v", err) }
+    walletC := eth.AddressFromPrivate(privC)
+
+    stub := newMTMStub(t, []string{walletA, walletB, walletC})
+    defer stub.Close()
+    leader.SetMTMBaseURL(stub.URL())
+    nodeB.SetMTMBaseURL(stub.URL())
+    nodeC.SetMTMBaseURL(stub.URL())
+
     // Leader URL hint for nodes (not strictly needed in this unit test)
     leader.SetLeader("http://leader", true)
     nodeB.SetLeader("http://leader", false)
@@ -57,24 +73,20 @@ func TestTxVotingFlow(t *testing.T) {
 
     // Prepare collects from B and C
     data := "hello-vote"
-    type collect struct {
-        Data   string `json:"data"`
-        Wallet string `json:"public_wallet"`
-        Sig    string `json:"firma_content"`
-    }
-    // sign with B
-    privB, err := eth.ParsePrivateKey(keyB)
-    if err != nil { t.Fatalf("parse B: %v", err) }
-    sigB, addrB, err := eth.SignPersonal([]byte(data), privB)
+    sigB, _, err := eth.SignPersonal([]byte(data), privB)
     if err != nil { t.Fatalf("sign B: %v", err) }
-    // sign with C
-    privC, err := eth.ParsePrivateKey(keyC)
-    if err != nil { t.Fatalf("parse C: %v", err) }
-    sigC, addrC, err := eth.SignPersonal([]byte(data), privC)
+    sigC, _, err := eth.SignPersonal([]byte(data), privC)
     if err != nil { t.Fatalf("sign C: %v", err) }
 
+    proofB := stub.Proof(walletB)
+    proofSigB, _, err := eth.SignPersonal(canonicalProofBytes(walletB, proofB), privB)
+    if err != nil { t.Fatalf("sign proof B: %v", err) }
+    proofC := stub.Proof(walletC)
+    proofSigC, _, err := eth.SignPersonal(canonicalProofBytes(walletC, proofC), privC)
+    if err != nil { t.Fatalf("sign proof C: %v", err) }
+
     // First collect (from B) => 202
-    b1, _ := json.Marshal(collect{Data: data, Wallet: addrB, Sig: sigB})
+    b1, _ := json.Marshal(collectReq{Data: data, Wallet: walletB, Sig: sigB, Proof: proofB, ProofSig: proofSigB})
     req1, _ := http.NewRequest(http.MethodPost, tsA.URL+"/v1/tx/collect", bytes.NewReader(b1))
     req1.Header.Set("Content-Type", "application/json")
     req1.Header.Set("Authorization", "Bearer t")
@@ -85,7 +97,7 @@ func TestTxVotingFlow(t *testing.T) {
     io.Copy(io.Discard, res1.Body)
 
     // Second collect (from C) => triggers proposal + IBFT; handler responde 202 mientras IBFT corre
-    b2, _ := json.Marshal(collect{Data: data, Wallet: addrC, Sig: sigC})
+    b2, _ := json.Marshal(collectReq{Data: data, Wallet: walletC, Sig: sigC, Proof: proofC, ProofSig: proofSigC})
     req2, _ := http.NewRequest(http.MethodPost, tsA.URL+"/v1/tx/collect", bytes.NewReader(b2))
     req2.Header.Set("Content-Type", "application/json")
     req2.Header.Set("Authorization", "Bearer t")

@@ -28,6 +28,9 @@ func main() {
 	if pk := os.Getenv("ETH_PRIVATE_KEY"); pk != "" {
 		n.SetPrivateKey(pk)
 	}
+	if mtm := os.Getenv("MTM_BASE_URL"); mtm != "" {
+		n.SetMTMBaseURL(mtm)
+	}
 	log.Printf("starting node %s on %s with %d peers and %d validators", id, addr, len(peerList), len(valList))
 
 	// Run server in background to support graceful shutdown on signals
