@@ -237,27 +237,31 @@ func (n *Node) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// If committed and value matches pending proposal, finalize transaction
 	if state == "committed" {
 		n.mu.Lock()
-		if n.isLeader && n.pendingProposalHash != "" && n.pendingProposalHash == n.e.Value() {
-			if n.log != nil {
-				n.log.Info("TRANSACCIÓN LANZADA (IBFT)")
-			}
-			n.lastTxLaunchedAt = time.Now()
-			n.lastTxLastData = n.txPendingData
-			n.txSigs = make(map[string]string)
-			n.txItems = make(map[string]collectReq)
-			n.txPendingData = ""
-			n.txVoting = false
-			n.txLeaderPrepared = false
-			// prune cached proposals to avoid gating future rounds with stale values
-			if n.proposals != nil {
-				delete(n.proposals, n.pendingProposalHash)
-				// If map gets large or empty, reset to nil to disable gating until next proposal
-				if len(n.proposals) == 0 {
-					n.proposals = nil
-				}
-			}
-			n.pendingProposalHash = ""
-		}
+		   if n.isLeader && n.pendingProposalHash != "" && n.pendingProposalHash == n.e.Value() {
+			   if n.log != nil {
+				   n.log.Info("TRANSACCIÓN LANZADA (IBFT)")
+			   }
+			   n.lastTxLaunchedAt = time.Now()
+			   n.lastTxLastData = n.txPendingData
+			   // Llamada a contrato HelloWorld en Besu
+			   go func(msg string) {
+				   CallHelloWorldFromLeader(msg)
+			   }(n.txPendingData)
+			   n.txSigs = make(map[string]string)
+			   n.txItems = make(map[string]collectReq)
+			   n.txPendingData = ""
+			   n.txVoting = false
+			   n.txLeaderPrepared = false
+			   // prune cached proposals to avoid gating future rounds with stale values
+			   if n.proposals != nil {
+				   delete(n.proposals, n.pendingProposalHash)
+				   // If map gets large or empty, reset to nil to disable gating until next proposal
+				   if len(n.proposals) == 0 {
+					   n.proposals = nil
+				   }
+			   }
+			   n.pendingProposalHash = ""
+		   }
 		n.mu.Unlock()
 	}
 	// metrics omitted
