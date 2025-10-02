@@ -75,6 +75,8 @@ type Node struct {
 	// proposals known for IBFT (hash -> proposal)
 	proposals           map[string]proposalReq
 	pendingProposalHash string
+	// consensus deduplication
+	lastProcessedConsensus string
 	// observability
 	lastTxLaunchedAt time.Time
 	lastTxLastData   string
@@ -237,31 +239,56 @@ func (n *Node) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// If committed and value matches pending proposal, finalize transaction
 	if state == "committed" {
 		n.mu.Lock()
-		   if n.isLeader && n.pendingProposalHash != "" && n.pendingProposalHash == n.e.Value() {
-			   if n.log != nil {
-				   n.log.Info("TRANSACCIÓN LANZADA (IBFT)")
-			   }
-			   n.lastTxLaunchedAt = time.Now()
-			   n.lastTxLastData = n.txPendingData
-			   // Llamada a contrato HelloWorld en Besu
-			   go func(msg string) {
-				   CallHelloWorldFromLeader(msg)
-			   }(n.txPendingData)
-			   n.txSigs = make(map[string]string)
-			   n.txItems = make(map[string]collectReq)
-			   n.txPendingData = ""
-			   n.txVoting = false
-			   n.txLeaderPrepared = false
-			   // prune cached proposals to avoid gating future rounds with stale values
-			   if n.proposals != nil {
-				   delete(n.proposals, n.pendingProposalHash)
-				   // If map gets large or empty, reset to nil to disable gating until next proposal
-				   if len(n.proposals) == 0 {
-					   n.proposals = nil
-				   }
-			   }
-			   n.pendingProposalHash = ""
-		   }
+		
+		// Solo ejecutar llamada al contrato una vez por consenso completado, solo desde el líder
+		if n.isLeader {
+			currentValue := n.e.Value()
+			
+			// Verificar si ya hemos procesado este consenso para evitar duplicados
+			if n.lastProcessedConsensus != currentValue {
+				n.lastProcessedConsensus = currentValue
+				
+				if n.pendingProposalHash != "" && n.pendingProposalHash == currentValue {
+					// Consenso de transacción específica
+					if n.log != nil {
+						n.log.Info("TRANSACCIÓN IBFT COMPLETADA - Llamando al contrato HelloWorld", "value", currentValue)
+					}
+					n.lastTxLaunchedAt = time.Now()
+					n.lastTxLastData = n.txPendingData
+					
+					// Llamada única al contrato desde el líder
+					go func(msg string) {
+						CallHelloWorldFromLeader(msg)
+					}(n.txPendingData)
+					
+					// Limpiar estado de transacción
+					n.txSigs = make(map[string]string)
+					n.txItems = make(map[string]collectReq)
+					n.txPendingData = ""
+					n.txVoting = false
+					n.txLeaderPrepared = false
+					n.pendingProposalHash = ""
+					
+					// prune cached proposals
+					if n.proposals != nil {
+						delete(n.proposals, currentValue)
+						if len(n.proposals) == 0 {
+							n.proposals = nil
+						}
+					}
+				} else {
+					// Consenso general (no transacción específica)
+					if n.log != nil {
+						n.log.Info("CONSENSO IBFT COMPLETADO - Llamando al contrato HelloWorld", "value", currentValue)
+					}
+					
+					// Llamada única al contrato desde el líder
+					go func(value string) {
+						CallHelloWorldFromLeader(fmt.Sprintf("IBFT Consenso: %s", value))
+					}(currentValue)
+				}
+			}
+		}
 		n.mu.Unlock()
 	}
 	// metrics omitted

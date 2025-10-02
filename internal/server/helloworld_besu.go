@@ -2,13 +2,12 @@ package server
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"log"
 	"math/big"
 	"os"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -16,7 +15,7 @@ import (
 )
 
 // Replace with your deployed contract address
-const HelloWorldAddress = "0xYourHelloWorldContractAddress"
+const HelloWorldAddress = "0x914b73cc9c6f74F4DBB3a6b2e5ee274cBCEB5Cc3"
 
 // Replace with your contract ABI
 const HelloWorldABI = `[
@@ -34,7 +33,15 @@ func SendHelloWorldTx(rpcURL, privKeyHex, message string) error {
 	}
 	defer client.Close()
 
-	privKey, err := crypto.HexToECDSA(privKeyHex)
+	// Remove 0x prefix if present
+	cleanPrivKey := privKeyHex
+	if strings.HasPrefix(cleanPrivKey, "0x") {
+		cleanPrivKey = cleanPrivKey[2:]
+	}
+	
+	log.Printf("DEBUG: privKeyHex='%s', cleanPrivKey='%s'", privKeyHex, cleanPrivKey)
+
+	privKey, err := crypto.HexToECDSA(cleanPrivKey)
 	if err != nil {
 		return err
 	}
@@ -81,19 +88,88 @@ func SendHelloWorldTx(rpcURL, privKeyHex, message string) error {
 		return err
 	}
 
-	log.Printf("HelloWorld setMessage tx sent: %s", signedTx.Hash().Hex())
+	log.Printf("IBFT HelloWorld setMessage tx sent: %s", signedTx.Hash().Hex())
 	return nil
 }
 
-// Example usage: call from leader node when authorized
+// CallHelloWorldFromLeader calls HelloWorld contract from IBFT leader when consensus completes
 func CallHelloWorldFromLeader(msg string) {
-	rpc := os.Getenv("BESU_RPC_URL") // e.g. http://besu-dev.sirt-xfsc.click:8545
-	priv := os.Getenv("ETH_PRIVATE_KEY")
-	if rpc == "" || priv == "" {
-		log.Println("Missing BESU_RPC_URL or ETH_PRIVATE_KEY")
+	rpcURL := os.Getenv("BESU_RPC_URL")
+	if rpcURL == "" {
+		rpcURL = "http://besu-dev.sirt-xfsc.click:8545"
+	}
+
+	privKeyHex := os.Getenv("ETH_PRIVATE_KEY")
+	if privKeyHex == "" {
+		log.Printf("IBFT HelloWorld: ETH_PRIVATE_KEY not set")
 		return
 	}
-	if err := SendHelloWorldTx(rpc, priv, msg); err != nil {
-		log.Printf("Error sending HelloWorld tx: %v", err)
+
+	// Asegurar que la clave no tenga prefijo 0x
+	if strings.HasPrefix(privKeyHex, "0x") {
+		privKeyHex = privKeyHex[2:]
 	}
+
+	log.Printf("IBFT: Calling contract with message: %s", msg)
+
+	client, err := ethclient.Dial(rpcURL)
+	if err != nil {
+		log.Printf("IBFT HelloWorld RPC connection failed: %v", err)
+		return
+	}
+	defer client.Close()
+
+	privKey, err := crypto.HexToECDSA(privKeyHex)
+	if err != nil {
+		log.Printf("IBFT HelloWorld private key parse failed: %v", err)
+		return
+	}
+
+	fromAddr := crypto.PubkeyToAddress(privKey.PublicKey)
+	nonce, err := client.PendingNonceAt(context.Background(), fromAddr)
+	if err != nil {
+		log.Printf("IBFT HelloWorld nonce fetch failed: %v", err)
+		return
+	}
+
+	gasPrice, err := client.SuggestGasPrice(context.Background())
+	if err != nil {
+		log.Printf("IBFT HelloWorld gas price fetch failed: %v", err)
+		return
+	}
+
+	parsedABI, err := abi.JSON(strings.NewReader(HelloWorldABI))
+	if err != nil {
+		log.Printf("IBFT HelloWorld ABI parse failed: %v", err)
+		return
+	}
+
+	input, err := parsedABI.Pack("setMessage", msg)
+	if err != nil {
+		log.Printf("IBFT HelloWorld function pack failed: %v", err)
+		return
+	}
+
+	toAddr := common.HexToAddress(HelloWorldAddress)
+	tx := types.NewTransaction(nonce, toAddr, big.NewInt(0), 200000, gasPrice, input)
+
+	chainID, err := client.NetworkID(context.Background())
+	if err != nil {
+		log.Printf("IBFT HelloWorld chain ID fetch failed: %v", err)
+		return
+	}
+
+	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), privKey)
+	if err != nil {
+		log.Printf("IBFT HelloWorld transaction signing failed: %v", err)
+		return
+	}
+
+	err = client.SendTransaction(context.Background(), signedTx)
+	if err != nil {
+		log.Printf("IBFT HelloWorld transaction send failed: %v", err)
+		return
+	}
+
+	log.Printf("IBFT HelloWorld SUCCESS: tx %s, message: %s", signedTx.Hash().Hex(), msg)
 }
