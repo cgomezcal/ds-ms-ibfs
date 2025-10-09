@@ -1,52 +1,233 @@
-version: '3.9'
 services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    restart: unless-stopped
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      CONFLUENT_SUPPORT_METRICS_ENABLE: 'false'
+
+  mtm1:
+    build:
+      context: ../dsc-ms-mtm
+      dockerfile: Dockerfile
+    environment:
+      HTTP_ADDR: ":8080"
+      GRPC_ADDR: ":9090"
+      KAFKA_BROKERS: "none"
+      BOOTSTRAP_PRODUCE: "false"
+      RAFT_ENABLED: "true"
+      RAFT_DATA_DIR: "/tmp/raft"
+      RAFT_BIND_ADDR: "mtm1:12000"
+      RAFT_NODE_ID: "node-1"
+      RAFT_BOOTSTRAP: "true"
+      RAFT_PEERS: "node-1@mtm1:12000,node-2@mtm2:12000,node-3@mtm3:12000,node-4@mtm4:12000"
+      FORWARDING_ENABLED: "true"
+      FORWARD_HTTP: "http://mtm1:8080/leader,http://mtm2:8080/leader,http://mtm3:8080/leader,http://mtm4:8080/leader"
+      FORWARD_GRPC: "mtm1:9090,mtm2:9090,mtm3:9090,mtm4:9090"
+      BESU_RPC_URL: "http://besu-dev.sirt-xfsc.click:8545"
+      ETH_PRIVATE_KEY: "0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0"
+      HELLOWORLD_ADDRESS: "0x914b73cc9c6f74F4DBB3a6b2e5ee274cBCEB5Cc3"
+    networks: [default]
+    ports:
+      - "8081:8080"
+      - "9191:9090"
+
+  mtm2:
+    build:
+      context: ../dsc-ms-mtm
+      dockerfile: Dockerfile
+    environment:
+      HTTP_ADDR: ":8080"
+      GRPC_ADDR: ":9090"
+      KAFKA_BROKERS: "none"
+      BOOTSTRAP_PRODUCE: "false"
+      RAFT_ENABLED: "true"
+      RAFT_DATA_DIR: "/tmp/raft"
+      RAFT_BIND_ADDR: "mtm2:12000"
+      RAFT_NODE_ID: "node-2"
+      RAFT_BOOTSTRAP: "false"
+      RAFT_PEERS: ""
+      FORWARDING_ENABLED: "true"
+      FORWARD_HTTP: "http://mtm1:8080/leader,http://mtm2:8080/leader,http://mtm3:8080/leader,http://mtm4:8080/leader"
+      FORWARD_GRPC: "mtm1:9090,mtm2:9090,mtm3:9090,mtm4:9090"
+      RAFT_JOIN_HTTP: "http://mtm1:8080/raft/join,http://mtm2:8080/raft/join,http://mtm3:8080/raft/join,http://mtm4:8080/raft/join"
+      AUTO_REMOVE_DEAD: "true"
+      AUTO_REMOVE_AFTER: "5s"
+      FORWARD_IDS: "node-1,node-2,node-3,node-4"
+      BESU_RPC_URL: "http://besu-dev.sirt-xfsc.click:8545"
+      ETH_PRIVATE_KEY: "0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d"
+      HELLOWORLD_ADDRESS: "0x914b73cc9c6f74F4DBB3a6b2e5ee274cBCEB5Cc3"
+    networks: [default]
+    ports:
+      - "8082:8080"
+      - "9192:9090"
+
+  mtm3:
+    build:
+      context: ../dsc-ms-mtm
+      dockerfile: Dockerfile
+    environment:
+      HTTP_ADDR: ":8080"
+      GRPC_ADDR: ":9090"
+      KAFKA_BROKERS: "none"
+      BOOTSTRAP_PRODUCE: "false"
+      RAFT_ENABLED: "true"
+      RAFT_DATA_DIR: "/tmp/raft"
+      RAFT_BIND_ADDR: "mtm3:12000"
+      RAFT_NODE_ID: "node-3"
+      RAFT_BOOTSTRAP: "false"
+      RAFT_PEERS: ""
+      FORWARDING_ENABLED: "true"
+      FORWARD_HTTP: "http://mtm1:8080/leader,http://mtm2:8080/leader,http://mtm3:8080/leader,http://mtm4:8080/leader"
+      FORWARD_GRPC: "mtm1:9090,mtm2:9090,mtm3:9090,mtm4:9090"
+      RAFT_JOIN_HTTP: "http://mtm1:8080/raft/join,http://mtm2:8080/raft/join,http://mtm3:8080/raft/join,http://mtm4:8080/raft/join"
+      AUTO_REMOVE_DEAD: "true"
+      AUTO_REMOVE_AFTER: "5s"
+      FORWARD_IDS: "node-1,node-2,node-3,node-4"
+      BESU_RPC_URL: "http://besu-dev.sirt-xfsc.click:8545"
+      ETH_PRIVATE_KEY: "0x8f2a559490b8d6e3d2b1016da0fbdc3f5b6b6f9bcd3d2e2c2a2b1a1a0a9a8a7a"
+      HELLOWORLD_ADDRESS: "0x914b73cc9c6f74F4DBB3a6b2e5ee274cBCEB5Cc3"
+    networks: [default]
+    ports:
+      - "8083:8080"
+      - "9193:9090"
+
+  mtm4:
+    build:
+      context: ../dsc-ms-mtm
+      dockerfile: Dockerfile
+    environment:
+      HTTP_ADDR: ":8080"
+      GRPC_ADDR: ":9090"
+      KAFKA_BROKERS: "none"
+      BOOTSTRAP_PRODUCE: "false"
+      RAFT_ENABLED: "true"
+      RAFT_DATA_DIR: "/tmp/raft"
+      RAFT_BIND_ADDR: "mtm4:12000"
+      RAFT_NODE_ID: "node-4"
+      RAFT_BOOTSTRAP: "false"
+      RAFT_PEERS: ""
+      FORWARDING_ENABLED: "true"
+      FORWARD_HTTP: "http://mtm1:8080/leader,http://mtm2:8080/leader,http://mtm3:8080/leader,http://mtm4:8080/leader"
+      FORWARD_GRPC: "mtm1:9090,mtm2:9090,mtm3:9090,mtm4:9090"
+      RAFT_JOIN_HTTP: "http://mtm1:8080/raft/join,http://mtm2:8080/raft/join,http://mtm3:8080/raft/join,http://mtm4:8080/raft/join"
+      AUTO_REMOVE_DEAD: "true"
+      AUTO_REMOVE_AFTER: "5s"
+      FORWARD_IDS: "node-1,node-2,node-3,node-4"
+      BESU_RPC_URL: "http://besu-dev.sirt-xfsc.click:8545"
+      ETH_PRIVATE_KEY: "0x5c51f7b14a6b3c2e9d8a7f6e5d4c3b2a190817161514131211100f0e0d0c0b0a"
+      HELLOWORLD_ADDRESS: "0x914b73cc9c6f74F4DBB3a6b2e5ee274cBCEB5Cc3"
+    networks: [default]
+    ports:
+      - "8084:8080"
+      - "9194:9090"
+
   nodea:
     build: .
     command: ["--id","A","--addr",":8091","--peers","http://nodeb:8092,http://nodec:8093,http://noded:8094","--validators","A,B,C,D"]
+    depends_on:
+      - mtm1
+      - kafka
     ports: ["8091:8091"]
     environment:
-      - PEER_TOKEN=t
-      - LEADER_URL=http://nodea:8091
-      - IS_LEADER=true
+      PEER_TOKEN: "t"
+      LEADER_URL: "http://nodea:8091"
+      IS_LEADER: "true"
       # Demo dev key (do not use in prod)
-      - ETH_PRIVATE_KEY=0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0
-      - MTM_BASE_URL=http://host.docker.internal:8081
-      - BESU_RPC_URL=http://besu-dev.sirt-xfsc.click:8545
+      ETH_PRIVATE_KEY: "0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0"
+      MTM_BASE_URL: "http://mtm1:8080"
+      BESU_RPC_URL: "http://besu-dev.sirt-xfsc.click:8545"
+      KAFKA_BROKERS: "kafka:29092"
+      KAFKA_RESPONSE_TOPIC: "execute_transaction_response"
     extra_hosts:
       - "host.docker.internal:host-gateway"
   nodeb:
     build: .
     command: ["--id","B","--addr",":8092","--peers","http://nodea:8091,http://nodec:8093,http://noded:8094","--validators","A,B,C,D"]
+    depends_on:
+      - mtm2
+      - kafka
     ports: ["8092:8092"]
     environment:
-      - PEER_TOKEN=t
-      - LEADER_URL=http://nodea:8091
-      - IS_LEADER=false
-      - ETH_PRIVATE_KEY=0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d
-      - MTM_BASE_URL=http://host.docker.internal:8081
+      PEER_TOKEN: "t"
+      LEADER_URL: "http://nodea:8091"
+      IS_LEADER: "false"
+      ETH_PRIVATE_KEY: "0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d"
+      MTM_BASE_URL: "http://mtm2:8080"
+      KAFKA_BROKERS: "kafka:29092"
+      KAFKA_RESPONSE_TOPIC: "execute_transaction_response"
     extra_hosts:
       - "host.docker.internal:host-gateway"
   nodec:
     build: .
     command: ["--id","C","--addr",":8093","--peers","http://nodea:8091,http://nodeb:8092,http://noded:8094","--validators","A,B,C,D"]
+    depends_on:
+      - mtm3
+      - kafka
     ports: ["8093:8093"]
     environment:
-      - PEER_TOKEN=t
-      - LEADER_URL=http://nodea:8091
-      - IS_LEADER=false
-      - ETH_PRIVATE_KEY=0x8f2a559490b8d6e3d2b1016da0fbdc3f5b6b6f9bcd3d2e2c2a2b1a1a0a9a8a7a
-      - MTM_BASE_URL=http://host.docker.internal:8081
+      PEER_TOKEN: "t"
+      LEADER_URL: "http://nodea:8091"
+      IS_LEADER: "false"
+      ETH_PRIVATE_KEY: "0x8f2a559490b8d6e3d2b1016da0fbdc3f5b6b6f9bcd3d2e2c2a2b1a1a0a9a8a7a"
+      MTM_BASE_URL: "http://mtm3:8080"
+      KAFKA_BROKERS: "kafka:29092"
+      KAFKA_RESPONSE_TOPIC: "execute_transaction_response"
     extra_hosts:
       - "host.docker.internal:host-gateway"
   noded:
     build: .
     command: ["--id","D","--addr",":8094","--peers","http://nodea:8091,http://nodeb:8092,http://nodec:8093","--validators","A,B,C,D"]
+    depends_on:
+      - mtm4
+      - kafka
     ports: ["8094:8094"]
     environment:
-      - PEER_TOKEN=t
-      - LEADER_URL=http://nodea:8091
-      - IS_LEADER=false
-      - ETH_PRIVATE_KEY=0x5c51f7b14a6b3c2e9d8a7f6e5d4c3b2a190817161514131211100f0e0d0c0b0a
-      - MTM_BASE_URL=http://host.docker.internal:8081
+      PEER_TOKEN: "t"
+      LEADER_URL: "http://nodea:8091"
+      IS_LEADER: "false"
+      ETH_PRIVATE_KEY: "0x5c51f7b14a6b3c2e9d8a7f6e5d4c3b2a190817161514131211100f0e0d0c0b0a"
+      MTM_BASE_URL: "http://mtm4:8080"
+      KAFKA_BROKERS: "kafka:29092"
+      KAFKA_RESPONSE_TOPIC: "execute_transaction_response"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  kafka_ibft:
+    build: .
+    entrypoint: ["/usr/local/bin/kafka_ibft"]
+    depends_on:
+      - kafka
+      - nodea
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      - KAFKA_REQUEST_TOPIC=execute_transaction
+      - KAFKA_RESPONSE_TOPIC=execute_transaction_response
+      - KAFKA_REQUEST_GROUP_ID=kafka-ibft-executor
+      - KAFKA_RESPONSE_GROUP_ID=kafka-ibft-listener
+      - IBFT_EXECUTE_URL=http://nodea:8091/v1/tx/execute-transaction
+    restart: unless-stopped

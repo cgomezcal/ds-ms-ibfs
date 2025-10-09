@@ -86,7 +86,7 @@ func TestTxVotingFlow(t *testing.T) {
     if err != nil { t.Fatalf("sign proof C: %v", err) }
 
     // First collect (from B) => 202
-    b1, _ := json.Marshal(collectReq{Data: data, Wallet: walletB, Sig: sigB, Proof: proofB, ProofSig: proofSigB})
+    b1, _ := json.Marshal(collectReq{Data: data, Wallet: walletB, Sig: sigB, Proof: proofB, ProofSig: proofSigB, ParticipantID: "B"})
     req1, _ := http.NewRequest(http.MethodPost, tsA.URL+"/v1/tx/collect", bytes.NewReader(b1))
     req1.Header.Set("Content-Type", "application/json")
     req1.Header.Set("Authorization", "Bearer t")
@@ -97,7 +97,7 @@ func TestTxVotingFlow(t *testing.T) {
     io.Copy(io.Discard, res1.Body)
 
     // Second collect (from C) => triggers proposal + IBFT; handler responde 202 mientras IBFT corre
-    b2, _ := json.Marshal(collectReq{Data: data, Wallet: walletC, Sig: sigC, Proof: proofC, ProofSig: proofSigC})
+    b2, _ := json.Marshal(collectReq{Data: data, Wallet: walletC, Sig: sigC, Proof: proofC, ProofSig: proofSigC, ParticipantID: "C"})
     req2, _ := http.NewRequest(http.MethodPost, tsA.URL+"/v1/tx/collect", bytes.NewReader(b2))
     req2.Header.Set("Content-Type", "application/json")
     req2.Header.Set("Authorization", "Bearer t")

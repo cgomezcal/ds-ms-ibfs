@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/cgomezcal/ds-ms-ibfs/internal/server"
@@ -30,6 +31,22 @@ func main() {
 	}
 	if mtm := os.Getenv("MTM_BASE_URL"); mtm != "" {
 		n.SetMTMBaseURL(mtm)
+	}
+	if brokersEnv := os.Getenv("KAFKA_BROKERS"); brokersEnv != "" {
+		parts := strings.Split(brokersEnv, ",")
+		brokers := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if v := strings.TrimSpace(p); v != "" {
+				brokers = append(brokers, v)
+			}
+		}
+		if len(brokers) > 0 {
+			respTopic := strings.TrimSpace(os.Getenv("KAFKA_RESPONSE_TOPIC"))
+			if respTopic == "" {
+				respTopic = "execute_transaction_response"
+			}
+			n.EnableKafkaProducer(brokers, respTopic)
+		}
 	}
 	log.Printf("starting node %s on %s with %d peers and %d validators", id, addr, len(peerList), len(valList))
 

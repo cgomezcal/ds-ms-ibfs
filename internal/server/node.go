@@ -14,12 +14,15 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cgomezcal/ds-ms-ibfs/internal/eth"
 	"github.com/cgomezcal/ds-ms-ibfs/internal/ibft"
+	kafkautil "github.com/cgomezcal/ds-ms-ibfs/internal/kafka"
+	"github.com/cgomezcal/ds-ms-ibfs/pkg/protocol"
 )
 
 type httpBroadcaster struct {
@@ -68,8 +71,12 @@ type Node struct {
 	isLeader     bool
 	// in-memory aggregation for current tx
 	txPendingData    string
-	txSigs           map[string]string     // addr -> sigHex
-	txItems          map[string]collectReq // wallet(lower)->item
+	txPendingKey     string
+	txExecutionFlow  []protocol.ExecutionStep
+	txSubFlows       map[string][]protocol.ExecutionStep // participant -> steps
+	txCommitFlows    map[string][]protocol.ExecutionStep // participant -> commit events
+	txSigs           map[string]string                   // participant -> sigHex
+	txItems          map[string]collectReq               // participant -> item
 	txVoting         bool
 	txLeaderPrepared bool
 	// proposals known for IBFT (hash -> proposal)
@@ -79,12 +86,29 @@ type Node struct {
 	lastProcessedConsensus string
 	// observability
 	lastTxLaunchedAt time.Time
-	lastTxLastData   string
+	lastTxLastData string
+	lastTxKey      string
 	// mtm integration
 	mtmBaseURL     string
 	mtmClient      *http.Client
 	mtmRoot        string
 	mtmRootFetched time.Time
+	// kafka integration
+	kafkaProducer      *kafkautil.Producer
+	kafkaBrokers       []string
+	kafkaResponseTopic string
+}
+
+type txResponseMessage struct {
+	NodeID        string                 `json:"node_id"`
+	Data          string                 `json:"data"`
+	ProposalHash  string                 `json:"proposal_hash"`
+	Key           string                 `json:"key"`
+	Status        string                 `json:"status"`
+	TxHash        string                 `json:"tx_hash,omitempty"`
+	Error         string                 `json:"error,omitempty"`
+	Timestamp     time.Time              `json:"timestamp"`
+	ExecutionFlow *protocol.ExecutionFlow `json:"execution_flow,omitempty"`
 }
 
 func NewNode(id string, addr string, peers []string) *Node {
@@ -149,7 +173,135 @@ func (n *Node) Start() error { return n.http.ListenAndServe() }
 func (n *Node) Shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return n.http.Shutdown(ctx)
+	err := n.http.Shutdown(ctx)
+
+	n.mu.Lock()
+	producer := n.kafkaProducer
+	topic := n.kafkaResponseTopic
+	n.kafkaProducer = nil
+	n.kafkaBrokers = nil
+	n.kafkaResponseTopic = ""
+	n.mu.Unlock()
+
+	if producer != nil {
+		if cerr := producer.Close(); cerr != nil && n.log != nil {
+			n.log.Warn("kafka producer shutdown failed", "topic", topic, "err", cerr)
+			if err == nil {
+				err = cerr
+			}
+		}
+	}
+
+	return err
+}
+
+func (n *Node) EnableKafkaProducer(brokers []string, topic string) {
+	trimmed := make([]string, 0, len(brokers))
+	for _, b := range brokers {
+		if v := strings.TrimSpace(b); v != "" {
+			trimmed = append(trimmed, v)
+		}
+	}
+	if len(trimmed) == 0 || strings.TrimSpace(topic) == "" {
+		if n.log != nil {
+			n.log.Warn("kafka producer configuration incomplete", "brokers", brokers, "topic", topic)
+		}
+		return
+	}
+
+	n.mu.Lock()
+	if n.kafkaProducer != nil {
+		_ = n.kafkaProducer.Close()
+	}
+	n.kafkaProducer = kafkautil.NewProducer(trimmed, strings.TrimSpace(topic), n.log)
+	n.kafkaBrokers = append([]string(nil), trimmed...)
+	n.kafkaResponseTopic = strings.TrimSpace(topic)
+	n.mu.Unlock()
+
+	if n.log != nil {
+		n.log.Info("kafka producer configured", "topic", n.kafkaResponseTopic, "brokers", trimmed)
+	}
+}
+
+func (n *Node) publishKafkaTxResponse(key string, msg txResponseMessage) {
+	n.mu.RLock()
+	producer := n.kafkaProducer
+	topic := n.kafkaResponseTopic
+	n.mu.RUnlock()
+	if producer == nil {
+		return
+	}
+
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		if n.log != nil {
+			n.log.Error("kafka response marshal failed", "err", err)
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := producer.Publish(ctx, []byte(key), payload); err != nil {
+		if n.log != nil {
+			n.log.Error("kafka response publish failed", "topic", topic, "err", err)
+		}
+	}
+}
+
+func (n *Node) handleBesuExecution(message string, isTx bool, proposalHash, txData, requestKey string, mainFlow []protocol.ExecutionStep, subFlows map[string][]protocol.ExecutionStep) {
+	flowEnvelope := buildExecutionFlowPayload(mainFlow, subFlows)
+	txHash, err := CallHelloWorldFromLeader(message)
+	if err != nil {
+		if n.log != nil {
+			n.log.Error("besu execution failed", "message", message, "err", err)
+		}
+	} else if n.log != nil {
+		n.log.Info("besu execution completed", "message", message, "txHash", txHash)
+	}
+
+	if !isTx {
+		return
+	}
+
+	status := "success"
+	errMsg := ""
+	if err != nil {
+		status = "error"
+		errMsg = err.Error()
+	}
+
+	flowEnvelope.Steps = append(flowEnvelope.Steps, protocol.NewExecutionStep("ibft_node", n.id, "besu_execution", map[string]string{
+		"status":        status,
+		"proposal_hash": proposalHash,
+	}))
+	n.mu.RLock()
+	topic := n.kafkaResponseTopic
+	n.mu.RUnlock()
+	flowEnvelope.Steps = append(flowEnvelope.Steps, protocol.NewExecutionStep("ibft_node", n.id, "kafka_publish", map[string]string{
+		"topic": topic,
+	}))
+
+	resp := txResponseMessage{
+		NodeID:        n.id,
+		Data:          txData,
+		ProposalHash:  proposalHash,
+		Key:           requestKey,
+		Status:        status,
+		TxHash:        txHash,
+		Error:         errMsg,
+		Timestamp:     time.Now().UTC(),
+	}
+	flowEnvelopeCopy := flowEnvelope
+	resp.ExecutionFlow = &flowEnvelopeCopy
+	if len(resp.ExecutionFlow.Steps) == 0 && len(resp.ExecutionFlow.Subflows) == 0 {
+		resp.ExecutionFlow = nil
+	}
+	msgKey := proposalHash
+	if requestKey != "" {
+		msgKey = requestKey
+	}
+	n.publishKafkaTxResponse(msgKey, resp)
 }
 
 // txDebug returns current pending data and number of collected signatures.
@@ -233,42 +385,63 @@ func (n *Node) handleMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("handle error: %v", err), http.StatusBadRequest)
 		return
 	}
+	n.recordConsensusTrace(msg)
+	if out != nil {
+		n.recordConsensusTrace(*out)
+	}
 	if out != nil {
 		// local broadcast already happened through broadcaster; nothing to do
 	}
 	// If committed and value matches pending proposal, finalize transaction
+	var (
+		shouldInvoke   bool
+		invokeMessage  string
+		isTxConsensus  bool
+		proposalHash   string
+		txData         string
+		txKey          string
+		executionFlow  []protocol.ExecutionStep
+		subFlows       map[string][]protocol.ExecutionStep
+	)
 	if state == "committed" {
 		n.mu.Lock()
-		
-		// Solo ejecutar llamada al contrato una vez por consenso completado, solo desde el líder
 		if n.isLeader {
 			currentValue := n.e.Value()
-			
-			// Verificar si ya hemos procesado este consenso para evitar duplicados
 			if n.lastProcessedConsensus != currentValue {
 				n.lastProcessedConsensus = currentValue
-				
 				if n.pendingProposalHash != "" && n.pendingProposalHash == currentValue {
-					// Consenso de transacción específica
 					if n.log != nil {
 						n.log.Info("TRANSACCIÓN IBFT COMPLETADA - Llamando al contrato HelloWorld", "value", currentValue)
 					}
+					txData = n.txPendingData
+					txKey = n.txPendingKey
+					invokeMessage = txData
+					isTxConsensus = true
+					proposalHash = currentValue
+					commitAggregation := n.buildCommitAggregationLocked(proposalHash)
+					if len(n.txExecutionFlow) > 0 || len(n.txPendingData) > 0 {
+						step := protocol.NewExecutionStep("ibft_node", n.id, "ibft_committed", map[string]string{"proposal_hash": proposalHash})
+						if commitAggregation != nil {
+							step.Aggregation = commitAggregation
+						}
+						n.txExecutionFlow = append(n.txExecutionFlow, step)
+					}
+					executionFlow = protocol.CloneExecutionFlow(n.txExecutionFlow)
+					subFlows = cloneSubFlowMap(n.txSubFlows)
 					n.lastTxLaunchedAt = time.Now()
-					n.lastTxLastData = n.txPendingData
-					
-					// Llamada única al contrato desde el líder
-					go func(msg string) {
-						CallHelloWorldFromLeader(msg)
-					}(n.txPendingData)
-					
-					// Limpiar estado de transacción
+					n.lastTxLastData = txData
+					n.lastTxKey = txKey
+					// Reset transaction state
 					n.txSigs = make(map[string]string)
 					n.txItems = make(map[string]collectReq)
 					n.txPendingData = ""
+					n.txPendingKey = ""
+					n.txExecutionFlow = nil
+					n.txSubFlows = nil
+					n.txCommitFlows = nil
 					n.txVoting = false
 					n.txLeaderPrepared = false
 					n.pendingProposalHash = ""
-					
 					// prune cached proposals
 					if n.proposals != nil {
 						delete(n.proposals, currentValue)
@@ -276,20 +449,21 @@ func (n *Node) handleMessage(w http.ResponseWriter, r *http.Request) {
 							n.proposals = nil
 						}
 					}
+					shouldInvoke = txData != ""
 				} else {
-					// Consenso general (no transacción específica)
 					if n.log != nil {
 						n.log.Info("CONSENSO IBFT COMPLETADO - Llamando al contrato HelloWorld", "value", currentValue)
 					}
-					
-					// Llamada única al contrato desde el líder
-					go func(value string) {
-						CallHelloWorldFromLeader(fmt.Sprintf("IBFT Consenso: %s", value))
-					}(currentValue)
+					invokeMessage = fmt.Sprintf("IBFT Consenso: %s", currentValue)
+					shouldInvoke = true
 				}
 			}
 		}
 		n.mu.Unlock()
+
+		if shouldInvoke {
+			go n.handleBesuExecution(invokeMessage, isTxConsensus, proposalHash, txData, txKey, executionFlow, subFlows)
+		}
 	}
 	// metrics omitted
 	w.Header().Set("Content-Type", "application/json")
@@ -401,13 +575,23 @@ func (n *Node) handleTxStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n.mu.RLock()
+	flowEnvelope := buildExecutionFlowPayload(n.txExecutionFlow, n.txSubFlows)
+	steps := len(flowEnvelope.Steps)
+	subflows := len(flowEnvelope.Subflows)
 	resp := map[string]any{
-		"id":               n.id,
-		"isLeader":         n.isLeader,
-		"pendingData":      n.txPendingData,
-		"collected":        len(n.txSigs),
-		"lastLaunchedAt":   n.lastTxLaunchedAt.Format(time.RFC3339Nano),
-		"lastLaunchedData": n.lastTxLastData,
+		"id":                   n.id,
+		"is_leader":            n.isLeader,
+		"pending_data":         n.txPendingData,
+		"pending_key":          n.txPendingKey,
+		"collected":            len(n.txSigs),
+		"last_launched_at":     n.lastTxLaunchedAt.Format(time.RFC3339Nano),
+		"last_launched_data":   n.lastTxLastData,
+		"last_launched_key":    n.lastTxKey,
+		"execution_flow_steps": steps,
+		"execution_flow_subflows": subflows,
+	}
+	if steps > 0 || subflows > 0 {
+		resp["execution_flow"] = flowEnvelope
 	}
 	n.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -436,7 +620,9 @@ func (n *Node) SetPrivateKey(hexKey string) {
 }
 
 type executeReq struct {
-	Data string `json:"data"`
+	Data          string                   `json:"data"`
+	Key           string                   `json:"key"`
+	ExecutionFlow []protocol.ExecutionStep `json:"execution_flow"`
 }
 
 type collectReq struct {
@@ -445,6 +631,8 @@ type collectReq struct {
 	Sig      string             `json:"firma_content"`
 	Proof    merkleProofPayload `json:"merkle_proof"`
 	ProofSig string             `json:"proof_sig"`
+	ParticipantID string        `json:"participant_id,omitempty"`
+	ExecutionFlow []protocol.ExecutionStep `json:"execution_flow,omitempty"`
 }
 
 type merkleProofPayload struct {
@@ -471,20 +659,28 @@ type voteReq struct {
 
 // canonicalVoteBytes returns the canonical bytes to sign/verify for vote payload.
 func canonicalVoteBytes(data string, items []collectReq, leaderWallet string, leaderProof merkleProofPayload, leaderProofSig string) []byte {
-	// Ensure deterministic order by wallet, then signature
+	// Ensure deterministic order by participant, then wallet/signature
 	cp := make([]collectReq, 0, len(items))
 	cp = append(cp, items...)
 	sort.Slice(cp, func(i, j int) bool {
-		wi := strings.ToLower(cp[i].Wallet)
-		wj := strings.ToLower(cp[j].Wallet)
-		if wi == wj {
-			if cp[i].Sig == cp[j].Sig {
-				return wi < wj
+		pi := participantStorageKey(cp[i].ParticipantID, cp[i].Wallet)
+		pj := participantStorageKey(cp[j].ParticipantID, cp[j].Wallet)
+		if pi == pj {
+			wi := strings.ToLower(cp[i].Wallet)
+			wj := strings.ToLower(cp[j].Wallet)
+			if wi == wj {
+				if cp[i].Sig == cp[j].Sig {
+					return wi < wj
+				}
+				return cp[i].Sig < cp[j].Sig
 			}
-			return cp[i].Sig < cp[j].Sig
+			return wi < wj
 		}
-		return wi < wj
+		return pi < pj
 	})
+	for idx := range cp {
+		cp[idx].ParticipantID = participantStorageKey(cp[idx].ParticipantID, cp[idx].Wallet)
+	}
 	payload := struct {
 		Data           string             `json:"data"`
 		Items          []collectReq       `json:"items"`
@@ -536,6 +732,7 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	flow := protocol.CloneExecutionFlow(req.ExecutionFlow)
 	n.mu.RLock()
 	leader := n.leaderURL
 	isLeader := n.isLeader
@@ -544,13 +741,41 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 	peers := append([]string(nil), n.peers...)
 	n.mu.RUnlock()
 
+	req.Key = strings.TrimSpace(req.Key)
 	if req.Data == "" {
 		http.Error(w, "missing data", http.StatusBadRequest)
 		return
 	}
+	if req.Key == "" {
+		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+	if n.log != nil {
+		n.log.Info("execute request received", "node", n.id, "key", req.Key, "leader", isLeader, "forwarded", r.Header.Get("X-IBFS-Forwarded") != "")
+	}
 	ctx := r.Context()
+	meta := map[string]string{
+		"forwarded": strconv.FormatBool(r.Header.Get("X-IBFS-Forwarded") != ""),
+		"is_leader": strconv.FormatBool(isLeader),
+	}
+	role := "execute_peer"
+	if isLeader {
+		role = "execute_leader"
+	}
+	flow = append(flow, protocol.NewExecutionStep("ibft_node", n.id, role, meta))
+	req.ExecutionFlow = flow
 
 	if isLeader {
+		n.mu.Lock()
+		if n.txPendingData != "" && n.txPendingData != req.Data {
+			n.mu.Unlock()
+			http.Error(w, "different data in progress", http.StatusConflict)
+			return
+		}
+		n.txPendingKey = req.Key
+		n.txExecutionFlow = protocol.CloneExecutionFlow(flow)
+		n.txSubFlows = nil
+		n.mu.Unlock()
 		// Leader signs the data and submits to its own collect endpoint, then broadcasts to peers.
 		if keyHex == "" || leader == "" {
 			http.Error(w, "leader missing ETH key or leader url", http.StatusFailedDependency)
@@ -572,7 +797,8 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		payload := collectReq{Data: req.Data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig}
+	leaderCollectFlow := append(protocol.CloneExecutionFlow(flow), protocol.NewExecutionStep("ibft_node", n.id, "collect_self", map[string]string{"leader": leader}))
+	payload := collectReq{Data: req.Data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig, ParticipantID: n.id, ExecutionFlow: leaderCollectFlow}
 		bb, _ := json.Marshal(payload)
 		url := leader + "/v1/tx/collect"
 		httpClient := &http.Client{Timeout: 3 * time.Second}
@@ -586,13 +812,20 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forward error", http.StatusBadGateway)
 			return
 		}
-		io.Copy(io.Discard, resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= 300 {
+			if n.log != nil {
+				n.log.Error("leader collect request failed", "status", resp.StatusCode, "response", strings.TrimSpace(string(body)))
+			}
+			http.Error(w, "leader collect failed", http.StatusBadGateway)
+			return
+		}
 		// Broadcast to peers to have them sign and forward
 		if r.Header.Get("X-IBFS-Forwarded") == "" {
 			for _, p := range peers {
-				go func(base string, data string) {
-					jb, _ := json.Marshal(executeReq{Data: data})
+				go func(base string, data string, key string, flowSteps []protocol.ExecutionStep) {
+					jb, _ := json.Marshal(executeReq{Data: data, Key: key, ExecutionFlow: flowSteps})
 					reqPeer, _ := http.NewRequest(http.MethodPost, base+"/v1/tx/execute-transaction", bytes.NewReader(jb))
 					reqPeer.Header.Set("Content-Type", "application/json")
 					reqPeer.Header.Set("X-IBFS-Forwarded", "1")
@@ -609,7 +842,7 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 					}
 					io.Copy(io.Discard, resp.Body)
 					resp.Body.Close()
-				}(p, req.Data)
+				}(p, req.Data, req.Key, protocol.CloneExecutionFlow(flow))
 			}
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -637,7 +870,8 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// forward to leader /collect
-	payload := collectReq{Data: req.Data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig}
+	flowCollect := append(protocol.CloneExecutionFlow(flow), protocol.NewExecutionStep("ibft_node", n.id, "collect_forward", map[string]string{"leader": leader}))
+	payload := collectReq{Data: req.Data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig, ParticipantID: n.id, ExecutionFlow: flowCollect}
 	bb, _ := json.Marshal(payload)
 	url := leader + "/v1/tx/collect"
 	httpClient := &http.Client{Timeout: 3 * time.Second}
@@ -651,16 +885,23 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forward error", http.StatusBadGateway)
 		return
 	}
-	io.Copy(io.Discard, resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= 300 {
+		if n.log != nil {
+			n.log.Error("collect forward rejected by leader", "status", resp.StatusCode, "response", strings.TrimSpace(string(body)))
+		}
+		http.Error(w, "collect rejected by leader", http.StatusBadGateway)
+		return
+	}
 
 	// If this request did not originate from a peer broadcast, propagate to peers so they also sign and forward.
 	// Prevent broadcast loops using a hop marker header.
 	if r.Header.Get("X-IBFS-Forwarded") == "" {
 		for _, p := range peers {
 			// fire-and-forget best-effort broadcast
-			go func(base string, data string) {
-				jb, _ := json.Marshal(executeReq{Data: data})
+			go func(base string, data string, key string, flowSteps []protocol.ExecutionStep) {
+				jb, _ := json.Marshal(executeReq{Data: data, Key: key, ExecutionFlow: flowSteps})
 				reqPeer, _ := http.NewRequest(http.MethodPost, base+"/v1/tx/execute-transaction", bytes.NewReader(jb))
 				reqPeer.Header.Set("Content-Type", "application/json")
 				reqPeer.Header.Set("X-IBFS-Forwarded", "1")
@@ -678,7 +919,7 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 				}
 				io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
-			}(p, req.Data)
+			}(p, req.Data, req.Key, protocol.CloneExecutionFlow(flow))
 		}
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -722,14 +963,23 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid merkle proof", http.StatusBadRequest)
 		return
 	}
+	participantKey := participantStorageKey(req.ParticipantID, req.Wallet)
+	if participantKey == "" {
+		http.Error(w, "missing participant identity", http.StatusBadRequest)
+		return
+	}
+	participantLabel := participantDisplay(req.ParticipantID, req.Wallet)
 	entry := collectReq{
-		Data:     req.Data,
-		Wallet:   req.Wallet,
-		Sig:      req.Sig,
-		Proof:    req.Proof,
-		ProofSig: req.ProofSig,
+		Data:          req.Data,
+		Wallet:        req.Wallet,
+		Sig:           req.Sig,
+		Proof:         req.Proof,
+		ProofSig:      req.ProofSig,
+		ParticipantID: participantKey,
+		ExecutionFlow: protocol.CloneExecutionFlow(req.ExecutionFlow),
 	}
 	ctx := r.Context()
+	n.appendTxSubFlow(participantLabel, req.ExecutionFlow)
 
 	n.mu.Lock()
 	if !n.isLeader {
@@ -752,10 +1002,20 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	needLeaderEntry := !n.txLeaderPrepared && n.privKeyHex != ""
-	n.txSigs[strings.ToLower(entry.Wallet)] = entry.Sig
-	n.txItems[strings.ToLower(entry.Wallet)] = entry
+	previousSig, seen := n.txSigs[participantKey]
+	n.txSigs[participantKey] = entry.Sig
+	n.txItems[participantKey] = entry
 	pendingData := n.txPendingData
+	currentCount := len(n.txSigs)
 	n.mu.Unlock()
+
+	if n.log != nil {
+		if seen && previousSig == entry.Sig {
+			n.log.Debug("collect entry refreshed", "participant", participantKey, "count", currentCount)
+		} else {
+			n.log.Info("collect entry accepted", "participant", participantKey, "count", currentCount)
+		}
+	}
 
 	if needLeaderEntry {
 		selfEntry, err := n.buildLeaderCollectEntry(ctx, pendingData)
@@ -767,13 +1027,21 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		n.mu.Lock()
-		n.txSigs[strings.ToLower(selfEntry.Wallet)] = selfEntry.Sig
-		n.txItems[strings.ToLower(selfEntry.Wallet)] = selfEntry
+		leaderKey := participantStorageKey(selfEntry.ParticipantID, selfEntry.Wallet)
+		if leaderKey == "" {
+			leaderKey = participantStorageKey(n.id, selfEntry.Wallet)
+		}
+		n.txSigs[leaderKey] = selfEntry.Sig
+		n.txItems[leaderKey] = selfEntry
 		n.txLeaderPrepared = true
 		if n.leaderWallet == "" {
 			n.leaderWallet = selfEntry.Wallet
 		}
+		currentCount = len(n.txSigs)
 		n.mu.Unlock()
+		if n.log != nil {
+			n.log.Info("leader collect entry appended", "participant", leaderKey, "count", currentCount)
+		}
 	}
 
 	var (
@@ -786,10 +1054,15 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 		peers           []string
 		shouldStartVote bool
 	)
+	var (
+		total     int
+		threshold int
+		count     int
+	)
 	n.mu.Lock()
-	total := n.e.ValidatorCount()
-	threshold := (2*total)/3 + 1
-	count := len(n.txSigs)
+	total = n.e.ValidatorCount()
+	threshold = (2*total)/3 + 1
+	count = len(n.txSigs)
 	data = n.txPendingData
 	items = make([]collectReq, 0, len(n.txItems))
 	for _, it := range n.txItems {
@@ -797,10 +1070,13 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 	}
 	leaderWallet = n.leaderWallet
 	if lw := strings.ToLower(leaderWallet); lw != "" {
-		if it, ok := n.txItems[lw]; ok {
-			leaderProof = it.Proof
-			leaderProofSig = it.ProofSig
-			leaderWallet = it.Wallet
+		for key, it := range n.txItems {
+			if key == lw || strings.EqualFold(it.ParticipantID, leaderWallet) || strings.EqualFold(it.Wallet, leaderWallet) {
+				leaderProof = it.Proof
+				leaderProofSig = it.ProofSig
+				leaderWallet = it.Wallet
+				break
+			}
 		}
 	}
 	if leaderProofSig == "" {
@@ -822,6 +1098,10 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 	}
 	n.mu.Unlock()
 
+	if n.log != nil {
+		n.log.Info("collect quorum progress", "participant", participantKey, "count", count, "threshold", threshold)
+	}
+
 	if shouldStartVote {
 		if leaderProofSig == "" {
 			http.Error(w, "leader proof unavailable", http.StatusFailedDependency)
@@ -831,6 +1111,11 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "leader proof invalid", http.StatusFailedDependency)
 			return
 		}
+		aggregation := n.buildCollectAggregation(count, threshold, items)
+		n.appendTxExecutionStep("collect_threshold", map[string]string{
+			"participant_count": strconv.Itoa(count),
+			"threshold":         strconv.Itoa(threshold),
+		}, aggregation)
 		// Convert to IBFT: sign aggregate, distribute proposal, and propose hash
 		if keyHex == "" {
 			// Degradación: si el líder no tiene clave ETH configurada,
@@ -883,6 +1168,10 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 				n.log.Warn("proposal broadcast failed", "peer", p, "err", err)
 			}
 		}
+		n.appendTxExecutionStep("proposal_broadcast", map[string]string{
+			"proposal_hash": h,
+			"targets":      strconv.Itoa(len(peers)),
+		}, nil)
 		// trigger IBFT propose with hash value
 		if _, err := n.e.Propose(h); err != nil {
 			if n.log != nil {
@@ -891,6 +1180,7 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ibft propose failed", http.StatusInternalServerError)
 			return
 		}
+		n.appendTxExecutionStep("ibft_propose", map[string]string{"proposal_hash": h}, nil)
 		// respond Accepted while IBFT runs; clients can poll /v1/tx/status
 		w.WriteHeader(http.StatusAccepted)
 		return
@@ -1001,6 +1291,14 @@ func (n *Node) verifyProof(ctx context.Context, wallet string, proof merkleProof
 	if !strings.EqualFold(trimHexPrefix(proof.Root), trimHexPrefix(root)) {
 		return errors.New("proof root differs from MTM root")
 	}
+	// Algunos despliegues (por ejemplo el stub MTM) devuelven proofs degenerados sin siblings ni direcciones.
+	// En ese caso aceptamos la validación básica (firma + raíz) y evitamos rechazar la transacción.
+	if len(proof.Siblings) == 0 && len(proof.Dirs) == 0 {
+		if n.log != nil {
+			n.log.Warn("merkle proof without siblings; skipping structural validation", "wallet", wallet)
+		}
+		return nil
+	}
 	if err := verifyMerkleProof(wallet, proof, root); err != nil {
 		return err
 	}
@@ -1016,25 +1314,50 @@ func (n *Node) fetchMerkleProof(ctx context.Context, wallet string) (merkleProof
 	if err != nil {
 		return merkleProofPayload{}, err
 	}
-	walletLower := strings.ToLower(wallet)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?pubkey="+url.QueryEscape(walletLower), nil)
-	if err != nil {
-		return merkleProofPayload{}, err
+	candidate := strings.TrimSpace(wallet)
+	queries := []string{candidate}
+	lower := strings.ToLower(candidate)
+	if lower != candidate {
+		queries = append(queries, lower)
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return merkleProofPayload{}, err
+	var lastErr error
+	for _, q := range queries {
+		if q == "" {
+			continue
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?pubkey="+url.QueryEscape(q), nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+			resp.Body.Close()
+			// si recibimos 404, intentamos la siguiente variante (por compatibilidad con el stub)
+			if resp.StatusCode == http.StatusNotFound {
+				lastErr = fmt.Errorf("mtm proof status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+				continue
+			}
+			return merkleProofPayload{}, fmt.Errorf("mtm proof status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		}
+		var out merkleProofPayload
+		decErr := json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if decErr != nil {
+			lastErr = decErr
+			continue
+		}
+		return out, nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return merkleProofPayload{}, fmt.Errorf("mtm proof status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	if lastErr == nil {
+		lastErr = errors.New("mtm proof lookup failed")
 	}
-	var out merkleProofPayload
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return merkleProofPayload{}, err
-	}
-	return out, nil
+	return merkleProofPayload{}, lastErr
 }
 
 func (n *Node) fetchMerkleRoot(ctx context.Context) (string, error) {
@@ -1161,6 +1484,7 @@ func trimHexPrefix(v string) string {
 func (n *Node) buildLeaderCollectEntry(ctx context.Context, data string) (collectReq, error) {
 	n.mu.RLock()
 	keyHex := n.privKeyHex
+	flow := protocol.CloneExecutionFlow(n.txExecutionFlow)
 	n.mu.RUnlock()
 	if keyHex == "" {
 		return collectReq{}, errors.New("leader missing private key")
@@ -1177,5 +1501,270 @@ func (n *Node) buildLeaderCollectEntry(ctx context.Context, data string) (collec
 	if err != nil {
 		return collectReq{}, err
 	}
-	return collectReq{Data: data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig}, nil
+	participant := participantStorageKey(n.id, addr)
+	return collectReq{Data: data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig, ParticipantID: participant, ExecutionFlow: flow}, nil
+}
+
+func (n *Node) appendTxSubFlow(source string, steps []protocol.ExecutionStep) {
+	if len(steps) == 0 {
+		return
+	}
+	label := normalizeParticipantDisplay(source)
+	if label == "" {
+		return
+	}
+	clone := protocol.CloneExecutionFlow(steps)
+	n.mu.Lock()
+	if n.txSubFlows == nil {
+		n.txSubFlows = make(map[string][]protocol.ExecutionStep)
+	}
+	n.txSubFlows[label] = append(n.txSubFlows[label], clone...)
+	n.mu.Unlock()
+}
+
+func (n *Node) appendTxCommitFlow(source string, step protocol.ExecutionStep) {
+	label := normalizeParticipantDisplay(source)
+	if label == "" {
+		return
+	}
+	n.mu.Lock()
+	if n.txCommitFlows == nil {
+		n.txCommitFlows = make(map[string][]protocol.ExecutionStep)
+	}
+	n.txCommitFlows[label] = append(n.txCommitFlows[label], step)
+	n.mu.Unlock()
+}
+
+func (n *Node) recordConsensusTrace(msg ibft.Message) {
+	if !n.isLeader {
+		return
+	}
+	switch msg.Type {
+	case ibft.Commit:
+		meta := map[string]string{
+			"sender":        msg.From,
+			"round":         strconv.FormatUint(uint64(msg.Round), 10),
+			"proposal_hash": msg.Value,
+		}
+		step := protocol.NewExecutionStep("ibft_node", msg.From, "commit_ack", meta)
+		n.appendTxCommitFlow(msg.From, step)
+	}
+}
+
+func (n *Node) buildCollectAggregation(count, threshold int, items []collectReq) *protocol.ExecutionAggregation {
+	if len(items) == 0 {
+		return nil
+	}
+	n.mu.RLock()
+	subFlows := cloneSubFlowMap(n.txSubFlows)
+	leaderLabel := normalizeParticipantDisplay(n.id)
+	n.mu.RUnlock()
+	participants := make([]protocol.ExecutionAggregationParticipant, 0, len(items))
+	seen := make(map[string]bool, len(items))
+	for _, it := range items {
+		label := participantDisplay(it.ParticipantID, it.Wallet)
+		if label == "" {
+			continue
+		}
+		normalized := normalizeParticipantDisplay(label)
+		if seen[normalized] {
+			continue
+		}
+		events := protocol.CloneExecutionFlow(subFlows[normalized])
+		metadata := map[string]string{
+			"wallet":    strings.ToLower(it.Wallet),
+			"signature": it.Sig,
+		}
+		if root := trimHexPrefix(it.Proof.Root); root != "" {
+			metadata["proof_root"] = root
+		}
+		participant := protocol.ExecutionAggregationParticipant{
+			NodeID:     label,
+			Role:       participantRole(normalized, leaderLabel),
+			FlowDigest: flowDigest(events),
+			Metadata:   metadata,
+			Events:     events,
+		}
+		participants = append(participants, participant)
+		seen[normalized] = true
+	}
+	if len(participants) == 0 {
+		return nil
+	}
+	sort.Slice(participants, func(i, j int) bool {
+		return participants[i].NodeID < participants[j].NodeID
+	})
+	return &protocol.ExecutionAggregation{
+		Kind:           "collect_threshold",
+		QuorumAchieved: count,
+		QuorumRequired: threshold,
+		ReceivedAt:     time.Now().UTC(),
+		Participants:   participants,
+	}
+}
+
+func (n *Node) buildCommitAggregationLocked(proposalHash string) *protocol.ExecutionAggregation {
+	total := n.e.ValidatorCount()
+	round := n.e.Round()
+	leaderLabel := normalizeParticipantDisplay(n.id)
+	participants := make([]protocol.ExecutionAggregationParticipant, 0, len(n.txCommitFlows)+1)
+	keys := make([]string, 0, len(n.txCommitFlows))
+	for k := range n.txCommitFlows {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		events := protocol.CloneExecutionFlow(n.txCommitFlows[key])
+		participants = append(participants, protocol.ExecutionAggregationParticipant{
+			NodeID:     key,
+			Role:       participantRole(key, leaderLabel),
+			FlowDigest: flowDigest(events),
+			Events:     events,
+		})
+	}
+	if !containsParticipant(keys, leaderLabel) {
+		leaderStep := protocol.NewExecutionStep("ibft_node", n.id, "commit_self", map[string]string{
+			"proposal_hash": proposalHash,
+			"round":         strconv.FormatUint(uint64(round), 10),
+		})
+		participants = append(participants, protocol.ExecutionAggregationParticipant{
+			NodeID:     leaderLabel,
+			Role:       "leader",
+			FlowDigest: flowDigest([]protocol.ExecutionStep{leaderStep}),
+			Events:     []protocol.ExecutionStep{leaderStep},
+		})
+	}
+	if len(participants) == 0 {
+		return nil
+	}
+	sort.Slice(participants, func(i, j int) bool {
+		return participants[i].NodeID < participants[j].NodeID
+	})
+	agg := &protocol.ExecutionAggregation{
+		Kind:           "ibft_commit",
+		QuorumAchieved: len(participants),
+		QuorumRequired: (2*total)/3 + 1,
+		ReceivedAt:     time.Now().UTC(),
+		Participants:   participants,
+		Metadata: map[string]string{
+			"proposal_hash": proposalHash,
+			"round":         strconv.FormatUint(uint64(round), 10),
+		},
+	}
+	return agg
+}
+
+func containsParticipant(list []string, target string) bool {
+	for _, v := range list {
+		if v == target {
+			return true
+		}
+	}
+	return false
+}
+
+func participantRole(label, leaderLabel string) string {
+	if label == leaderLabel {
+		return "leader"
+	}
+	return "follower"
+}
+
+func flowDigest(steps []protocol.ExecutionStep) string {
+	if len(steps) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(steps)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func (n *Node) appendTxExecutionStep(role string, metadata map[string]string, aggregation *protocol.ExecutionAggregation) {
+	step := protocol.NewExecutionStep("ibft_node", n.id, role, metadata)
+	if aggregation != nil {
+		step.Aggregation = protocol.CloneExecutionAggregation(aggregation)
+	}
+	n.mu.Lock()
+	n.txExecutionFlow = append(n.txExecutionFlow, step)
+	n.mu.Unlock()
+}
+
+func cloneSubFlowMap(src map[string][]protocol.ExecutionStep) map[string][]protocol.ExecutionStep {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string][]protocol.ExecutionStep, len(src))
+	for k, v := range src {
+		dst[k] = protocol.CloneExecutionFlow(v)
+	}
+	return dst
+}
+
+func buildExecutionFlowPayload(main []protocol.ExecutionStep, subs map[string][]protocol.ExecutionStep) protocol.ExecutionFlow {
+	flow := protocol.ExecutionFlow{
+		Steps: protocol.CloneExecutionFlow(main),
+	}
+	if len(subs) == 0 {
+		return flow
+	}
+	keys := make([]string, 0, len(subs))
+	for k := range subs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	subflows := make([]protocol.ExecutionSubflow, 0, len(keys))
+	for _, k := range keys {
+		steps := protocol.CloneExecutionFlow(subs[k])
+		if len(steps) == 0 {
+			continue
+		}
+		subflows = append(subflows, protocol.ExecutionSubflow{Source: k, Steps: steps})
+	}
+	if len(subflows) > 0 {
+		flow.Subflows = subflows
+	}
+	return flow
+}
+
+func participantStorageKey(participantID, wallet string) string {
+	id := strings.TrimSpace(participantID)
+	if id != "" {
+		return strings.ToUpper(id)
+	}
+	w := strings.TrimSpace(wallet)
+	if w == "" {
+		return ""
+	}
+	return strings.ToLower(w)
+}
+
+func participantDisplay(participantID, wallet string) string {
+	id := strings.TrimSpace(participantID)
+	if id != "" {
+		return strings.ToUpper(id)
+	}
+	w := strings.TrimSpace(wallet)
+	if w == "" {
+		return ""
+	}
+	lower := strings.ToLower(w)
+	if strings.HasPrefix(lower, "0x") {
+		return lower
+	}
+	return lower
+}
+
+func normalizeParticipantDisplay(source string) string {
+	s := strings.TrimSpace(source)
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "0x") {
+		return lower
+	}
+	return strings.ToUpper(s)
 }

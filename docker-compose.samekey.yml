@@ -1,0 +1,26 @@
+services:
+  mtm1:
+    environment:
+      ETH_PRIVATE_KEY: "0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0"
+  mtm2:
+    environment:
+      ETH_PRIVATE_KEY: "0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0"
+  mtm3:
+    environment:
+      ETH_PRIVATE_KEY: "0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0"
+  mtm4:
+    environment:
+      ETH_PRIVATE_KEY: "0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0"
+
+  nodea:
+    environment:
+      ETH_PRIVATE_KEY: "0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0"
+  nodeb:
+    environment:
+      ETH_PRIVATE_KEY: "0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0"
+  nodec:
+    environment:
+      ETH_PRIVATE_KEY: "0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0"
+  noded:
+    environment:
+      ETH_PRIVATE_KEY: "0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0"
