@@ -4,6 +4,9 @@
 			"path": "."
 		},
 		{
+			"path": "../dsc-ms-kafka-ibft"
+		},
+		{
 			"path": "../dsc-ms-mtm"
 		}
 	],
