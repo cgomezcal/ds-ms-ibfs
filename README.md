@@ -89,6 +89,8 @@ When consensus finalizes a transaction and the leader submits it to Besu, the no
 >   {
 >     "data": "<hex-or-plain-payload>",
 >     "key": "<uuid-or-custom-id>",
+>     "timestamp": "2025-10-07T10:21:30.123456Z",
+>     "type": "<logical-transaction-type>",
 >     "execution_flow": [
 >       {
 >         "component": "kafka_client",
@@ -99,7 +101,7 @@ When consensus finalizes a transaction and the leader submits it to Besu, the no
 >     ]
 >   }
 >   ```
->   `data` y `key` son obligatorios. `execution_flow` es opcional: si está presente, cada componente adicional hará `append` de un nuevo paso preservando los previos.
+>   `data` y `key` son obligatorios. El campo `timestamp` se rellena automáticamente en milisegundos UTC y `type` es opcional. `execution_flow` es opcional: si está presente, cada componente adicional hará `append` de un nuevo paso preservando los previos.
 > - Execute response topic (`execute_transaction_response`):
 >   ```json
 >   {
@@ -111,6 +113,7 @@ When consensus finalizes a transaction and the leader submits it to Besu, the no
 >     "tx_hash": "<besu-tx-hash>",
 >     "error": "<optional-error>",
 >     "timestamp": "2025-10-07T10:21:30.123456Z",
+>     "type": "<logical-transaction-type>",
 >     "execution_flow": [
 >       {
 >         "component": "kafka_client",
@@ -245,6 +248,25 @@ go test ./...
 ```
 
 Los tests `TestTxAggregationSameWalletParticipants` y `TestExecuteTransaction_FourNodesSameKey` validan que el líder cuenta cada participante aunque firme con la misma wallet, alcanza el umbral y registra la transacción completa en el estado del nodo.
+
+### Prueba in situ rápida
+
+Para lanzar una verificación rápida del flujo directo sin montar toda la infraestructura de Docker puedes usar el script `scripts/run_insitu_test.sh`, que levanta el MTM stub, inicia un nodo líder local y realiza una llamada real a `/v1/tx/execute-transaction`. **Por defecto apunta al Besu público `http://besu-dev.sirt-xfsc.click:8545`**, pero puedes sobreescribir la URL exportando `BESU_RPC_URL`:
+
+```bash
+./scripts/run_insitu_test.sh
+```
+
+El proceso muestra por consola el código HTTP devuelto y los logs relevantes del nodo y del stub. Puedes conservar los logs exportando `KEEP_LOGS=1` o sobreescribir puertos y payload mediante las variables `MTM_PORT`, `NODE_PORT`, `DATA_PAYLOAD`, `REQUEST_KEY` y `BESU_RPC_URL`.
+
+Si prefieres una invocación más corta, el `Makefile` incluye los objetivos:
+
+```bash
+make insitu-test
+make insitu-test-keep-logs
+```
+
+> Consejo: el script comprueba `web3_clientVersion` antes de arrancar el nodo IBFT, de forma que fallará inmediatamente si la URL (por defecto o personalizada) no responde.
 
 ## Notes and limitations
 

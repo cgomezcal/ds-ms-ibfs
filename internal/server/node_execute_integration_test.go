@@ -75,7 +75,7 @@ func TestExecuteTransaction_IBFT(t *testing.T) {
     nodeC.SetPrivateKey(keyC)
 
     // Execute from leader; leader should broadcast to peers for signing, reach threshold, distribute proposal, and IBFT commit.
-    payload := map[string]string{"data": "hola-ibft", "key": "test-request-1"}
+    payload := map[string]string{"data": "hola-ibft", "key": "test-request-1", "type": "contract-call"}
     body, _ := json.Marshal(payload)
     req, _ := http.NewRequest(http.MethodPost, tsA.URL+"/v1/tx/execute-transaction", bytes.NewReader(body))
     req.Header.Set("Content-Type", "application/json")
@@ -93,6 +93,9 @@ func TestExecuteTransaction_IBFT(t *testing.T) {
         json.NewDecoder(rs.Body).Decode(&cur)
         rs.Body.Close()
         if s, _ := cur["last_launched_at"].(string); s != "" {
+            if tpe, _ := cur["last_launched_type"].(string); tpe != payload["type"] {
+                t.Fatalf("expected last_launched_type %s, got %s", payload["type"], tpe)
+            }
             return
         }
         time.Sleep(50 * time.Millisecond)
@@ -149,7 +152,7 @@ func TestExecuteTransaction_FourNodesSameKey(t *testing.T) {
     nodeC.SetNetwork([]string{tsA.URL, tsB.URL, tsD.URL}, validators)
     nodeD.SetNetwork([]string{tsA.URL, tsB.URL, tsC.URL}, validators)
 
-    payload := map[string]string{"data": "hola-four-same-key", "key": "same-wallet-req"}
+    payload := map[string]string{"data": "hola-four-same-key", "key": "same-wallet-req", "type": "batch-call"}
     body, _ := json.Marshal(payload)
     req, _ := http.NewRequest(http.MethodPost, tsA.URL+"/v1/tx/execute-transaction", bytes.NewReader(body))
     req.Header.Set("Content-Type", "application/json")
@@ -164,14 +167,16 @@ func TestExecuteTransaction_FourNodesSameKey(t *testing.T) {
         leader.mu.RLock()
         launchedData := leader.lastTxLastData
         launchedKey := leader.lastTxKey
+        launchedType := leader.lastTxType
         leader.mu.RUnlock()
-        if launchedData == payload["data"] && launchedKey == payload["key"] {
+        if launchedData == payload["data"] && launchedKey == payload["key"] && launchedType == payload["type"] {
             return
         }
         time.Sleep(25 * time.Millisecond)
     }
     leader.mu.RLock()
     launchedData := leader.lastTxLastData
+    launchedType := leader.lastTxType
     leader.mu.RUnlock()
-    t.Fatalf("expected lastTxLastData to equal %s, got %s", payload["data"], launchedData)
+    t.Fatalf("expected lastTxLastData=%s and lastTxType=%s, got data=%s type=%s", payload["data"], payload["type"], launchedData, launchedType)
 }

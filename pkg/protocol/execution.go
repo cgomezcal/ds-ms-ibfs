@@ -9,8 +9,16 @@ import (
 	"time"
 )
 
+const (
+	ExecutionStepType                   = "execution_step"
+	ExecutionAggregationType            = "execution_aggregation"
+	ExecutionAggregationParticipantType = "execution_aggregation_participant"
+	ExecutionFlowType                   = "execution_flow"
+)
+
 // ExecutionStep describe un paso del flujo de ejecución cross-servicio.
 type ExecutionStep struct {
+	Type        string                `json:"execution_type"`
 	Component   string                `json:"component"`
 	InstanceID  string                `json:"instance_id"`
 	Hostname    string                `json:"hostname"`
@@ -24,6 +32,7 @@ type ExecutionStep struct {
 
 // ExecutionAggregation encapsula la información detallada de un cuórum alcanzado.
 type ExecutionAggregation struct {
+	Type           string                            `json:"type"`
 	Kind           string                            `json:"kind"`
 	QuorumAchieved int                               `json:"quorum_achieved"`
 	QuorumRequired int                               `json:"quorum_required"`
@@ -34,6 +43,7 @@ type ExecutionAggregation struct {
 
 // ExecutionAggregationParticipant describe el aporte individual de cada nodo al cuórum.
 type ExecutionAggregationParticipant struct {
+	Type       string            `json:"type"`
 	NodeID     string            `json:"node_id"`
 	Role       string            `json:"role,omitempty"`
 	FlowDigest string            `json:"flow_digest,omitempty"`
@@ -41,16 +51,10 @@ type ExecutionAggregationParticipant struct {
 	Events     []ExecutionStep   `json:"events,omitempty"`
 }
 
-// ExecutionSubflow describe la traza aportada por un componente colaborador.
-type ExecutionSubflow struct {
-	Source string          `json:"source"`
-	Steps  []ExecutionStep `json:"steps"`
-}
-
-// ExecutionFlow encapsula la traza principal y subflujos agregados.
+// ExecutionFlow encapsula la traza principal de la ejecución agregada.
 type ExecutionFlow struct {
-	Steps    []ExecutionStep    `json:"steps"`
-	Subflows []ExecutionSubflow `json:"subflows,omitempty"`
+	Type  string          `json:"type"`
+	Steps []ExecutionStep `json:"steps"`
 }
 
 // CloneExecutionFlow devuelve una copia superficial del slice de pasos.
@@ -61,6 +65,7 @@ func CloneExecutionFlow(src []ExecutionStep) []ExecutionStep {
 	dst := make([]ExecutionStep, len(src))
 	for i := range src {
 		dst[i] = src[i]
+		dst[i].Type = ExecutionStepType
 		if src[i].Aggregation != nil {
 			dst[i].Aggregation = CloneExecutionAggregation(src[i].Aggregation)
 		}
@@ -75,24 +80,11 @@ func CloneExecutionFlow(src []ExecutionStep) []ExecutionStep {
 	return dst
 }
 
-// CloneExecutionSubflows devuelve una copia profunda de los subflujos.
-func CloneExecutionSubflows(src []ExecutionSubflow) []ExecutionSubflow {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make([]ExecutionSubflow, len(src))
-	for i := range src {
-		dst[i].Source = src[i].Source
-		dst[i].Steps = CloneExecutionFlow(src[i].Steps)
-	}
-	return dst
-}
-
 // CloneExecutionFlowEnvelope devuelve una copia profunda del ExecutionFlow.
 func CloneExecutionFlowEnvelope(src ExecutionFlow) ExecutionFlow {
 	return ExecutionFlow{
-		Steps:    CloneExecutionFlow(src.Steps),
-		Subflows: CloneExecutionSubflows(src.Subflows),
+		Type:  ExecutionFlowType,
+		Steps: CloneExecutionFlow(src.Steps),
 	}
 }
 
@@ -102,6 +94,7 @@ func CloneExecutionAggregation(src *ExecutionAggregation) *ExecutionAggregation 
 		return nil
 	}
 	agg := &ExecutionAggregation{
+		Type:           ExecutionAggregationType,
 		Kind:           src.Kind,
 		QuorumAchieved: src.QuorumAchieved,
 		QuorumRequired: src.QuorumRequired,
@@ -124,6 +117,7 @@ func CloneExecutionAggregation(src *ExecutionAggregation) *ExecutionAggregation 
 
 func cloneAggregationParticipant(src ExecutionAggregationParticipant) ExecutionAggregationParticipant {
 	participant := ExecutionAggregationParticipant{
+		Type:       ExecutionAggregationParticipantType,
 		NodeID:     src.NodeID,
 		Role:       src.Role,
 		FlowDigest: src.FlowDigest,
@@ -145,6 +139,7 @@ func NewExecutionStep(component, instanceID, role string, metadata map[string]st
 		instanceID = info.hostname
 	}
 	step := ExecutionStep{
+		Type:       ExecutionStepType,
 		Component:  component,
 		InstanceID: instanceID,
 		Hostname:   info.hostname,

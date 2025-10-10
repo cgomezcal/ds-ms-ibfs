@@ -20,45 +20,14 @@ import (
 	"time"
 
 	"github.com/cgomezcal/ds-ms-ibfs/internal/eth"
-	"github.com/cgomezcal/ds-ms-ibfs/internal/ibft"
 	kafkautil "github.com/cgomezcal/ds-ms-ibfs/internal/kafka"
 	"github.com/cgomezcal/ds-ms-ibfs/pkg/protocol"
 )
 
-type httpBroadcaster struct {
-	client *http.Client
-	peers  []string
-	log    *slog.Logger
-	token  string
-}
-
-func (hb httpBroadcaster) Broadcast(msg ibft.Message) {
-	b, _ := json.Marshal(msg)
-	for _, p := range hb.peers {
-		url := p + "/v1/ibft/message"
-		go func(u string) {
-			req, _ := http.NewRequest(http.MethodPost, u, bytes.NewReader(b))
-			req.Header.Set("Content-Type", "application/json")
-			if hb.token != "" {
-				req.Header.Set("Authorization", "Bearer "+hb.token)
-			}
-			resp, err := hb.client.Do(req)
-			if err != nil {
-				if hb.log != nil {
-					hb.log.Error("broadcast failed", "peer", u, "err", err)
-				}
-				return
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}(url)
-	}
-}
-
 type Node struct {
 	id        string
 	peers     []string
-	e         *ibft.Engine
+	validators []string
 	mux       *http.ServeMux
 	http      *http.Server
 	mu        sync.RWMutex
@@ -72,22 +41,18 @@ type Node struct {
 	// in-memory aggregation for current tx
 	txPendingData    string
 	txPendingKey     string
+	txPendingType    string
 	txExecutionFlow  []protocol.ExecutionStep
-	txSubFlows       map[string][]protocol.ExecutionStep // participant -> steps
-	txCommitFlows    map[string][]protocol.ExecutionStep // participant -> commit events
 	txSigs           map[string]string                   // participant -> sigHex
 	txItems          map[string]collectReq               // participant -> item
-	txVoting         bool
+	txFinalizing     bool
 	txLeaderPrepared bool
-	// proposals known for IBFT (hash -> proposal)
-	proposals           map[string]proposalReq
-	pendingProposalHash string
-	// consensus deduplication
-	lastProcessedConsensus string
+	callHelloWorld   func(string) (string, error)
 	// observability
 	lastTxLaunchedAt time.Time
-	lastTxLastData string
-	lastTxKey      string
+	lastTxLastData   string
+	lastTxKey        string
+	lastTxType       string
 	// mtm integration
 	mtmBaseURL     string
 	mtmClient      *http.Client
@@ -100,14 +65,15 @@ type Node struct {
 }
 
 type txResponseMessage struct {
-	NodeID        string                 `json:"node_id"`
-	Data          string                 `json:"data"`
-	ProposalHash  string                 `json:"proposal_hash"`
-	Key           string                 `json:"key"`
-	Status        string                 `json:"status"`
-	TxHash        string                 `json:"tx_hash,omitempty"`
-	Error         string                 `json:"error,omitempty"`
-	Timestamp     time.Time              `json:"timestamp"`
+	NodeID        string                  `json:"node_id"`
+	Data          string                  `json:"data"`
+	ProposalHash  string                  `json:"proposal_hash"`
+	Key           string                  `json:"key"`
+	Status        string                  `json:"status"`
+	TxHash        string                  `json:"tx_hash,omitempty"`
+	Error         string                  `json:"error,omitempty"`
+	Timestamp     time.Time               `json:"timestamp"`
+	Type          string                  `json:"type"`
 	ExecutionFlow *protocol.ExecutionFlow `json:"execution_flow,omitempty"`
 }
 
@@ -125,14 +91,7 @@ func NewNode(id string, addr string, peers []string) *Node {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 
-	hb := httpBroadcaster{
-		peers:  peers,
-		client: &http.Client{Timeout: 2 * time.Second},
-		log:    logger,
-	}
-	n := &Node{id: id, peers: peers, log: logger, mtmClient: &http.Client{Timeout: 2 * time.Second}}
-	// Start with self-only validators; caller can SetNetwork later
-	n.e = ibft.NewEngine(id, []string{id}, hb)
+	n := &Node{id: id, peers: append([]string(nil), peers...), log: logger, mtmClient: &http.Client{Timeout: 2 * time.Second}, callHelloWorld: CallHelloWorldFromLeader}
 	// metrics intentionally omitted per requirements
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -140,20 +99,13 @@ func NewNode(id string, addr string, peers []string) *Node {
 		_, _ = w.Write([]byte("ok"))
 	})
 	// metrics endpoint omitted
-	mux.HandleFunc("/v1/ibft/message", n.handleMessage)
-	mux.HandleFunc("/v1/ibft/propose", n.handlePropose)
-	mux.HandleFunc("/v1/ibft/state", n.handleState)
 	// transaction endpoints
 	mux.HandleFunc("/v1/tx/execute-transaction", n.handleExecuteTx)
 	mux.HandleFunc("/v1/tx/collect", n.handleCollect)
-	mux.HandleFunc("/v1/tx/vote", n.handleVote)
-	mux.HandleFunc("/v1/tx/proposal", n.handleProposal)
 	mux.HandleFunc("/v1/tx/status", n.handleTxStatus)
 	// Backwards-compatible aliases without versioned prefix
 	mux.HandleFunc("/execute-transaction", n.handleExecuteTx)
 	mux.HandleFunc("/collect", n.handleCollect)
-	mux.HandleFunc("/vote", n.handleVote)
-	mux.HandleFunc("/proposal", n.handleProposal)
 	mux.HandleFunc("/tx/status", n.handleTxStatus)
 	n.mux = mux
 	n.http = &http.Server{
@@ -249,9 +201,13 @@ func (n *Node) publishKafkaTxResponse(key string, msg txResponseMessage) {
 	}
 }
 
-func (n *Node) handleBesuExecution(message string, isTx bool, proposalHash, txData, requestKey string, mainFlow []protocol.ExecutionStep, subFlows map[string][]protocol.ExecutionStep) {
-	flowEnvelope := buildExecutionFlowPayload(mainFlow, subFlows)
-	txHash, err := CallHelloWorldFromLeader(message)
+func (n *Node) handleBesuExecution(message string, isTx bool, proposalHash, txData, requestKey, txType string, mainFlow []protocol.ExecutionStep) {
+	flowEnvelope := buildExecutionFlowPayload(mainFlow)
+	execFn := n.callHelloWorld
+	if execFn == nil {
+		execFn = CallHelloWorldFromLeader
+	}
+	txHash, err := execFn(message)
 	if err != nil {
 		if n.log != nil {
 			n.log.Error("besu execution failed", "message", message, "err", err)
@@ -291,10 +247,11 @@ func (n *Node) handleBesuExecution(message string, isTx bool, proposalHash, txDa
 		TxHash:        txHash,
 		Error:         errMsg,
 		Timestamp:     time.Now().UTC(),
+		Type:          txType,
 	}
 	flowEnvelopeCopy := flowEnvelope
 	resp.ExecutionFlow = &flowEnvelopeCopy
-	if len(resp.ExecutionFlow.Steps) == 0 && len(resp.ExecutionFlow.Subflows) == 0 {
+	if len(resp.ExecutionFlow.Steps) == 0 {
 		resp.ExecutionFlow = nil
 	}
 	msgKey := proposalHash
@@ -317,10 +274,7 @@ func (n *Node) SetNetwork(peerURLs []string, validators []string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.peers = append([]string(nil), peerURLs...)
-	n.e.SetBroadcaster(httpBroadcaster{peers: n.peers, client: &http.Client{Timeout: 2 * time.Second}, log: n.log, token: n.peerToken})
-	if len(validators) > 0 {
-		n.e.SetValidators(validators)
-	}
+	n.validators = append([]string(nil), validators...)
 }
 
 // SetAuthToken configures a shared bearer token used for peer-to-peer requests.
@@ -329,8 +283,6 @@ func (n *Node) SetAuthToken(token string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.peerToken = token
-	// Refresh broadcaster with token if peers already set
-	n.e.SetBroadcaster(httpBroadcaster{peers: n.peers, client: &http.Client{Timeout: 2 * time.Second}, log: n.log, token: n.peerToken})
 }
 
 // SetMTMBaseURL configures the MTM service endpoint used for Merkle proofs.
@@ -342,232 +294,6 @@ func (n *Node) SetMTMBaseURL(base string) {
 	n.mtmRootFetched = time.Time{}
 }
 
-func (n *Node) handleMessage(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	// Peer auth (if configured)
-	n.mu.RLock()
-	token := n.peerToken
-	n.mu.RUnlock()
-	if token != "" {
-		if ah := r.Header.Get("Authorization"); ah != "Bearer "+token {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
-	if ct := r.Header.Get("Content-Type"); ct != "" && ct != "application/json" {
-		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	var msg ibft.Message
-	if err := dec.Decode(&msg); err != nil {
-		http.Error(w, "bad message", http.StatusBadRequest)
-		return
-	}
-	// Gate PrePrepare only if we are in proposal-driven flow (proposals cache non-empty)
-	if msg.Type == ibft.PrePrepare {
-		n.mu.RLock()
-		enforce := (n.proposals != nil && len(n.proposals) > 0)
-		_, known := n.proposals[msg.Value]
-		n.mu.RUnlock()
-		if enforce && !known {
-			http.Error(w, "unknown proposal", http.StatusBadRequest)
-			return
-		}
-	}
-	state, out, err := n.e.Handle(msg)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("handle error: %v", err), http.StatusBadRequest)
-		return
-	}
-	n.recordConsensusTrace(msg)
-	if out != nil {
-		n.recordConsensusTrace(*out)
-	}
-	if out != nil {
-		// local broadcast already happened through broadcaster; nothing to do
-	}
-	// If committed and value matches pending proposal, finalize transaction
-	var (
-		shouldInvoke   bool
-		invokeMessage  string
-		isTxConsensus  bool
-		proposalHash   string
-		txData         string
-		txKey          string
-		executionFlow  []protocol.ExecutionStep
-		subFlows       map[string][]protocol.ExecutionStep
-	)
-	if state == "committed" {
-		n.mu.Lock()
-		if n.isLeader {
-			currentValue := n.e.Value()
-			if n.lastProcessedConsensus != currentValue {
-				n.lastProcessedConsensus = currentValue
-				if n.pendingProposalHash != "" && n.pendingProposalHash == currentValue {
-					if n.log != nil {
-						n.log.Info("TRANSACCIÓN IBFT COMPLETADA - Llamando al contrato HelloWorld", "value", currentValue)
-					}
-					txData = n.txPendingData
-					txKey = n.txPendingKey
-					invokeMessage = txData
-					isTxConsensus = true
-					proposalHash = currentValue
-					commitAggregation := n.buildCommitAggregationLocked(proposalHash)
-					if len(n.txExecutionFlow) > 0 || len(n.txPendingData) > 0 {
-						step := protocol.NewExecutionStep("ibft_node", n.id, "ibft_committed", map[string]string{"proposal_hash": proposalHash})
-						if commitAggregation != nil {
-							step.Aggregation = commitAggregation
-						}
-						n.txExecutionFlow = append(n.txExecutionFlow, step)
-					}
-					executionFlow = protocol.CloneExecutionFlow(n.txExecutionFlow)
-					subFlows = cloneSubFlowMap(n.txSubFlows)
-					n.lastTxLaunchedAt = time.Now()
-					n.lastTxLastData = txData
-					n.lastTxKey = txKey
-					// Reset transaction state
-					n.txSigs = make(map[string]string)
-					n.txItems = make(map[string]collectReq)
-					n.txPendingData = ""
-					n.txPendingKey = ""
-					n.txExecutionFlow = nil
-					n.txSubFlows = nil
-					n.txCommitFlows = nil
-					n.txVoting = false
-					n.txLeaderPrepared = false
-					n.pendingProposalHash = ""
-					// prune cached proposals
-					if n.proposals != nil {
-						delete(n.proposals, currentValue)
-						if len(n.proposals) == 0 {
-							n.proposals = nil
-						}
-					}
-					shouldInvoke = txData != ""
-				} else {
-					if n.log != nil {
-						n.log.Info("CONSENSO IBFT COMPLETADO - Llamando al contrato HelloWorld", "value", currentValue)
-					}
-					invokeMessage = fmt.Sprintf("IBFT Consenso: %s", currentValue)
-					shouldInvoke = true
-				}
-			}
-		}
-		n.mu.Unlock()
-
-		if shouldInvoke {
-			go n.handleBesuExecution(invokeMessage, isTxConsensus, proposalHash, txData, txKey, executionFlow, subFlows)
-		}
-	}
-	// metrics omitted
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"state": state})
-}
-
-func (n *Node) handlePropose(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if ct := r.Header.Get("Content-Type"); ct != "" && ct != "application/json" {
-		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	var body struct {
-		Value string `json:"value"`
-	}
-	if err := dec.Decode(&body); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	msg, err := n.e.Propose(body.Value)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	// metrics omitted
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(msg)
-}
-
-func (n *Node) handleState(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	json.NewEncoder(w).Encode(map[string]any{
-		"id":    n.id,
-		"round": n.e.Round(),
-		"state": n.e.State(),
-		"value": n.e.Value(),
-	})
-}
-
-// handleProposal receives the aggregated payload from the leader, verifies its signature,
-// and stores it under a deterministic hash so IBFT can subsequently propose/commit it.
-func (n *Node) handleProposal(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	// Peer auth
-	n.mu.RLock()
-	token := n.peerToken
-	n.mu.RUnlock()
-	if token != "" {
-		if ah := r.Header.Get("Authorization"); ah != "Bearer "+token {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
-	if ct := r.Header.Get("Content-Type"); ct != "" && ct != "application/json" {
-		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	var pr proposalReq
-	if err := dec.Decode(&pr); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	// Verify leader signature over canonical bytes
-	b := canonicalVoteBytes(pr.Data, pr.Items, pr.LeaderWallet, pr.LeaderProof, pr.LeaderProofSig)
-	ok, err := eth.VerifyPersonal(b, pr.LeaderSig, pr.LeaderWallet)
-	if err != nil || !ok {
-		http.Error(w, "invalid leader signature", http.StatusBadRequest)
-		return
-	}
-	if err := n.verifyProof(r.Context(), pr.LeaderWallet, pr.LeaderProof, pr.LeaderProofSig); err != nil {
-		http.Error(w, "invalid leader proof", http.StatusBadRequest)
-		return
-	}
-	for _, item := range pr.Items {
-		if err := n.verifyProof(r.Context(), item.Wallet, item.Proof, item.ProofSig); err != nil {
-			http.Error(w, "invalid participant proof", http.StatusBadRequest)
-			return
-		}
-	}
-	// Cache proposal by hash
-	h := hashProposal(pr)
-	n.mu.Lock()
-	if n.proposals == nil {
-		n.proposals = make(map[string]proposalReq)
-	}
-	n.proposals[h] = pr
-	n.mu.Unlock()
-	w.WriteHeader(http.StatusAccepted)
-}
 
 func (n *Node) handleTxStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -575,22 +301,26 @@ func (n *Node) handleTxStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n.mu.RLock()
-	flowEnvelope := buildExecutionFlowPayload(n.txExecutionFlow, n.txSubFlows)
+	flowEnvelope := buildExecutionFlowPayload(n.txExecutionFlow)
 	steps := len(flowEnvelope.Steps)
-	subflows := len(flowEnvelope.Subflows)
+	lastLaunchedAt := ""
+	if !n.lastTxLaunchedAt.IsZero() {
+		lastLaunchedAt = n.lastTxLaunchedAt.Format(time.RFC3339Nano)
+	}
 	resp := map[string]any{
 		"id":                   n.id,
 		"is_leader":            n.isLeader,
 		"pending_data":         n.txPendingData,
 		"pending_key":          n.txPendingKey,
+		"pending_type":         n.txPendingType,
 		"collected":            len(n.txSigs),
-		"last_launched_at":     n.lastTxLaunchedAt.Format(time.RFC3339Nano),
+		"last_launched_at":     lastLaunchedAt,
 		"last_launched_data":   n.lastTxLastData,
 		"last_launched_key":    n.lastTxKey,
+		"last_launched_type":   n.lastTxType,
 		"execution_flow_steps": steps,
-		"execution_flow_subflows": subflows,
 	}
-	if steps > 0 || subflows > 0 {
+	if steps > 0 {
 		resp["execution_flow"] = flowEnvelope
 	}
 	n.mu.RUnlock()
@@ -619,19 +349,29 @@ func (n *Node) SetPrivateKey(hexKey string) {
 	n.mu.Unlock()
 }
 
+// SetBesuExecutor permite inyectar un ejecutor del contrato HelloWorld (principalmente en tests).
+func (n *Node) SetBesuExecutor(exec func(string) (string, error)) {
+	n.mu.Lock()
+	n.callHelloWorld = exec
+	n.mu.Unlock()
+}
+
 type executeReq struct {
 	Data          string                   `json:"data"`
 	Key           string                   `json:"key"`
+	Timestamp     string                   `json:"timestamp,omitempty"`
+	Type          string                   `json:"type,omitempty"`
 	ExecutionFlow []protocol.ExecutionStep `json:"execution_flow"`
 }
 
 type collectReq struct {
-	Data     string             `json:"data"`
-	Wallet   string             `json:"public_wallet"`
-	Sig      string             `json:"firma_content"`
-	Proof    merkleProofPayload `json:"merkle_proof"`
-	ProofSig string             `json:"proof_sig"`
-	ParticipantID string        `json:"participant_id,omitempty"`
+	Data          string                   `json:"data"`
+	Wallet        string                   `json:"public_wallet"`
+	Sig           string                   `json:"firma_content"`
+	Proof         merkleProofPayload       `json:"merkle_proof"`
+	ProofSig      string                   `json:"proof_sig"`
+	Type          string                   `json:"type,omitempty"`
+	ParticipantID string                   `json:"participant_id,omitempty"`
 	ExecutionFlow []protocol.ExecutionStep `json:"execution_flow,omitempty"`
 }
 
@@ -644,17 +384,6 @@ type merkleProofPayload struct {
 
 func (p merkleProofPayload) isZero() bool {
 	return p.Root == "" && len(p.Siblings) == 0 && len(p.Dirs) == 0 && p.Index == 0
-}
-
-// voteReq is sent by the leader to all peers to request a vote on the aggregate payload.
-// The signature (LeaderSig) is the personal_sign over the canonical JSON of {Data, Items}.
-type voteReq struct {
-	Data           string             `json:"data"`
-	Items          []collectReq       `json:"items"`
-	LeaderWallet   string             `json:"leader_wallet"`
-	LeaderSig      string             `json:"leader_sig"`
-	LeaderProof    merkleProofPayload `json:"leader_proof"`
-	LeaderProofSig string             `json:"leader_proof_sig"`
 }
 
 // canonicalVoteBytes returns the canonical bytes to sign/verify for vote payload.
@@ -742,6 +471,7 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 	n.mu.RUnlock()
 
 	req.Key = strings.TrimSpace(req.Key)
+	req.Type = strings.TrimSpace(req.Type)
 	if req.Data == "" {
 		http.Error(w, "missing data", http.StatusBadRequest)
 		return
@@ -751,7 +481,7 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if n.log != nil {
-		n.log.Info("execute request received", "node", n.id, "key", req.Key, "leader", isLeader, "forwarded", r.Header.Get("X-IBFS-Forwarded") != "")
+		n.log.Info("execute request received", "node", n.id, "key", req.Key, "type", req.Type, "leader", isLeader, "forwarded", r.Header.Get("X-IBFS-Forwarded") != "")
 	}
 	ctx := r.Context()
 	meta := map[string]string{
@@ -772,10 +502,37 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "different data in progress", http.StatusConflict)
 			return
 		}
+		if n.txPendingType != "" && req.Type != "" && n.txPendingType != req.Type {
+			n.mu.Unlock()
+			http.Error(w, "different type in progress", http.StatusConflict)
+			return
+		}
+		prevKey := n.txPendingKey
+		prevFlow := n.txExecutionFlow
+		typeAssigned := false
+		if n.txPendingType == "" && req.Type != "" {
+			n.txPendingType = req.Type
+			typeAssigned = true
+		}
 		n.txPendingKey = req.Key
 		n.txExecutionFlow = protocol.CloneExecutionFlow(flow)
-		n.txSubFlows = nil
 		n.mu.Unlock()
+
+		cleanup := true
+		defer func() {
+			if !cleanup {
+				return
+			}
+			n.mu.Lock()
+			if typeAssigned && n.txPendingType == req.Type {
+				n.txPendingType = ""
+			}
+			if n.txPendingKey == req.Key {
+				n.txPendingKey = prevKey
+			}
+			n.txExecutionFlow = prevFlow
+			n.mu.Unlock()
+		}()
 		// Leader signs the data and submits to its own collect endpoint, then broadcasts to peers.
 		if keyHex == "" || leader == "" {
 			http.Error(w, "leader missing ETH key or leader url", http.StatusFailedDependency)
@@ -798,7 +555,7 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 		}
 
 	leaderCollectFlow := append(protocol.CloneExecutionFlow(flow), protocol.NewExecutionStep("ibft_node", n.id, "collect_self", map[string]string{"leader": leader}))
-	payload := collectReq{Data: req.Data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig, ParticipantID: n.id, ExecutionFlow: leaderCollectFlow}
+	payload := collectReq{Data: req.Data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig, Type: req.Type, ParticipantID: n.id, ExecutionFlow: leaderCollectFlow}
 		bb, _ := json.Marshal(payload)
 		url := leader + "/v1/tx/collect"
 		httpClient := &http.Client{Timeout: 3 * time.Second}
@@ -824,8 +581,8 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 		// Broadcast to peers to have them sign and forward
 		if r.Header.Get("X-IBFS-Forwarded") == "" {
 			for _, p := range peers {
-				go func(base string, data string, key string, flowSteps []protocol.ExecutionStep) {
-					jb, _ := json.Marshal(executeReq{Data: data, Key: key, ExecutionFlow: flowSteps})
+				go func(base string, data string, key string, txType string, flowSteps []protocol.ExecutionStep) {
+					jb, _ := json.Marshal(executeReq{Data: data, Key: key, Type: txType, ExecutionFlow: flowSteps})
 					reqPeer, _ := http.NewRequest(http.MethodPost, base+"/v1/tx/execute-transaction", bytes.NewReader(jb))
 					reqPeer.Header.Set("Content-Type", "application/json")
 					reqPeer.Header.Set("X-IBFS-Forwarded", "1")
@@ -842,9 +599,10 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 					}
 					io.Copy(io.Discard, resp.Body)
 					resp.Body.Close()
-				}(p, req.Data, req.Key, protocol.CloneExecutionFlow(flow))
+				}(p, req.Data, req.Key, req.Type, protocol.CloneExecutionFlow(flow))
 			}
 		}
+		cleanup = false
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -871,7 +629,7 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 
 	// forward to leader /collect
 	flowCollect := append(protocol.CloneExecutionFlow(flow), protocol.NewExecutionStep("ibft_node", n.id, "collect_forward", map[string]string{"leader": leader}))
-	payload := collectReq{Data: req.Data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig, ParticipantID: n.id, ExecutionFlow: flowCollect}
+	payload := collectReq{Data: req.Data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig, Type: req.Type, ParticipantID: n.id, ExecutionFlow: flowCollect}
 	bb, _ := json.Marshal(payload)
 	url := leader + "/v1/tx/collect"
 	httpClient := &http.Client{Timeout: 3 * time.Second}
@@ -900,8 +658,8 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("X-IBFS-Forwarded") == "" {
 		for _, p := range peers {
 			// fire-and-forget best-effort broadcast
-			go func(base string, data string, key string, flowSteps []protocol.ExecutionStep) {
-				jb, _ := json.Marshal(executeReq{Data: data, Key: key, ExecutionFlow: flowSteps})
+			go func(base string, data string, key string, txType string, flowSteps []protocol.ExecutionStep) {
+				jb, _ := json.Marshal(executeReq{Data: data, Key: key, Type: txType, ExecutionFlow: flowSteps})
 				reqPeer, _ := http.NewRequest(http.MethodPost, base+"/v1/tx/execute-transaction", bytes.NewReader(jb))
 				reqPeer.Header.Set("Content-Type", "application/json")
 				reqPeer.Header.Set("X-IBFS-Forwarded", "1")
@@ -919,7 +677,7 @@ func (n *Node) handleExecuteTx(w http.ResponseWriter, r *http.Request) {
 				}
 				io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
-			}(p, req.Data, req.Key, protocol.CloneExecutionFlow(flow))
+			}(p, req.Data, req.Key, req.Type, protocol.CloneExecutionFlow(flow))
 		}
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -952,6 +710,7 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	req.Type = strings.TrimSpace(req.Type)
 
 	// verify signature
 	ok, err := eth.VerifyPersonal([]byte(req.Data), req.Sig, req.Wallet)
@@ -968,18 +727,17 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing participant identity", http.StatusBadRequest)
 		return
 	}
-	participantLabel := participantDisplay(req.ParticipantID, req.Wallet)
 	entry := collectReq{
 		Data:          req.Data,
 		Wallet:        req.Wallet,
 		Sig:           req.Sig,
 		Proof:         req.Proof,
 		ProofSig:      req.ProofSig,
+		Type:          req.Type,
 		ParticipantID: participantKey,
 		ExecutionFlow: protocol.CloneExecutionFlow(req.ExecutionFlow),
 	}
 	ctx := r.Context()
-	n.appendTxSubFlow(participantLabel, req.ExecutionFlow)
 
 	n.mu.Lock()
 	if !n.isLeader {
@@ -995,11 +753,23 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 	}
 	if n.txPendingData == "" {
 		n.txPendingData = entry.Data
+		if req.Type != "" {
+			n.txPendingType = req.Type
+		}
 		n.txLeaderPrepared = false
 	} else if n.txPendingData != entry.Data {
 		n.mu.Unlock()
 		http.Error(w, "different data in progress", http.StatusConflict)
 		return
+	} else {
+		if n.txPendingType != "" && req.Type != "" && n.txPendingType != req.Type {
+			n.mu.Unlock()
+			http.Error(w, "different type in progress", http.StatusConflict)
+			return
+		}
+		if n.txPendingType == "" && req.Type != "" {
+			n.txPendingType = req.Type
+		}
 	}
 	needLeaderEntry := !n.txLeaderPrepared && n.privKeyHex != ""
 	previousSig, seen := n.txSigs[participantKey]
@@ -1011,9 +781,9 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 
 	if n.log != nil {
 		if seen && previousSig == entry.Sig {
-			n.log.Debug("collect entry refreshed", "participant", participantKey, "count", currentCount)
+			n.log.Debug("collect entry refreshed", "participant", participantKey, "type", req.Type, "count", currentCount)
 		} else {
-			n.log.Info("collect entry accepted", "participant", participantKey, "count", currentCount)
+			n.log.Info("collect entry accepted", "participant", participantKey, "type", req.Type, "count", currentCount)
 		}
 	}
 
@@ -1045,14 +815,15 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		keyHex          string
-		data            string
-		items           []collectReq
-		leaderWallet    string
-		leaderProof     merkleProofPayload
-		leaderProofSig  string
-		peers           []string
-		shouldStartVote bool
+		keyHex         string
+		data           string
+		pendingType    string
+		pendingKey     string
+		items          []collectReq
+		leaderWallet   string
+		leaderProof    merkleProofPayload
+		leaderProofSig string
+		shouldFinalize bool
 	)
 	var (
 		total     int
@@ -1060,15 +831,23 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 		count     int
 	)
 	n.mu.Lock()
-	total = n.e.ValidatorCount()
+	total = len(n.validators)
+	if total == 0 {
+		total = len(n.txSigs)
+	}
+	if total == 0 {
+		total = 1
+	}
 	threshold = (2*total)/3 + 1
 	count = len(n.txSigs)
 	data = n.txPendingData
+	pendingType = n.txPendingType
 	items = make([]collectReq, 0, len(n.txItems))
 	for _, it := range n.txItems {
 		items = append(items, it)
 	}
 	leaderWallet = n.leaderWallet
+	pendingKey = n.txPendingKey
 	if lw := strings.ToLower(leaderWallet); lw != "" {
 		for key, it := range n.txItems {
 			if key == lw || strings.EqualFold(it.ParticipantID, leaderWallet) || strings.EqualFold(it.Wallet, leaderWallet) {
@@ -1091,10 +870,9 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	keyHex = n.privKeyHex
-	peers = append([]string(nil), n.peers...)
-	shouldStartVote = !n.txVoting && count >= threshold
-	if shouldStartVote {
-		n.txVoting = true
+	shouldFinalize = !n.txFinalizing && count >= threshold
+	if shouldFinalize {
+		n.txFinalizing = true
 	}
 	n.mu.Unlock()
 
@@ -1102,39 +880,44 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 		n.log.Info("collect quorum progress", "participant", participantKey, "count", count, "threshold", threshold)
 	}
 
-	if shouldStartVote {
+	if shouldFinalize {
+		aggregation := n.buildCollectAggregation(count, threshold, items)
+		if keyHex == "" {
+			if n.log != nil {
+				n.log.Warn("threshold reached but leader has no ETH key; skipping execution")
+			}
+			n.appendTxExecutionStep("collect_threshold", map[string]string{
+				"participant_count": strconv.Itoa(count),
+				"threshold":         strconv.Itoa(threshold),
+			}, aggregation)
+			n.clearFinalizingFlag()
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		if leaderProofSig == "" {
+			n.clearFinalizingFlag()
 			http.Error(w, "leader proof unavailable", http.StatusFailedDependency)
 			return
 		}
 		if err := n.verifyProof(ctx, leaderWallet, leaderProof, leaderProofSig); err != nil {
+			n.clearFinalizingFlag()
 			http.Error(w, "leader proof invalid", http.StatusFailedDependency)
 			return
 		}
-		aggregation := n.buildCollectAggregation(count, threshold, items)
 		n.appendTxExecutionStep("collect_threshold", map[string]string{
 			"participant_count": strconv.Itoa(count),
 			"threshold":         strconv.Itoa(threshold),
 		}, aggregation)
-		// Convert to IBFT: sign aggregate, distribute proposal, and propose hash
-		if keyHex == "" {
-			// Degradación: si el líder no tiene clave ETH configurada,
-			// no podemos firmar ni distribuir el proposal. Responder 202
-			// y dejar que el operador configure la clave para futuras rondas.
-			if n.log != nil {
-				n.log.Warn("threshold reached but leader has no ETH key; skipping IBFT proposal")
-			}
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
 		priv, err := eth.ParsePrivateKey(keyHex)
 		if err != nil {
+			n.clearFinalizingFlag()
 			http.Error(w, "invalid leader private key", http.StatusBadRequest)
 			return
 		}
 		payloadBytes := canonicalVoteBytes(data, items, leaderWallet, leaderProof, leaderProofSig)
 		sigHex, addr, err := eth.SignPersonal(payloadBytes, priv)
 		if err != nil {
+			n.clearFinalizingFlag()
 			http.Error(w, "leader sign error", http.StatusInternalServerError)
 			return
 		}
@@ -1142,100 +925,17 @@ func (n *Node) handleCollect(w http.ResponseWriter, r *http.Request) {
 			leaderWallet = addr
 		}
 		prop := proposalReq{Data: data, Items: items, LeaderWallet: leaderWallet, LeaderSig: sigHex, LeaderProof: leaderProof, LeaderProofSig: leaderProofSig}
-		body, _ := json.Marshal(prop)
-		// cache locally and compute hash
 		h := hashProposal(prop)
-		n.mu.Lock()
-		if n.proposals == nil {
-			n.proposals = make(map[string]proposalReq)
+		if pendingType == "" {
+			pendingType = req.Type
 		}
-		n.proposals[h] = prop
-		n.pendingProposalHash = h
-		n.mu.Unlock()
-		// broadcast proposal to peers
-		cli := &http.Client{Timeout: 1500 * time.Millisecond}
-		for _, p := range peers {
-			reqp, _ := http.NewRequest(http.MethodPost, p+"/v1/tx/proposal", bytes.NewReader(body))
-			reqp.Header.Set("Content-Type", "application/json")
-			if token != "" {
-				reqp.Header.Set("Authorization", "Bearer "+token)
-			}
-			resp, err := cli.Do(reqp)
-			if err == nil {
-				io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
-			} else if n.log != nil {
-				n.log.Warn("proposal broadcast failed", "peer", p, "err", err)
-			}
-		}
-		n.appendTxExecutionStep("proposal_broadcast", map[string]string{
-			"proposal_hash": h,
-			"targets":      strconv.Itoa(len(peers)),
-		}, nil)
-		// trigger IBFT propose with hash value
-		if _, err := n.e.Propose(h); err != nil {
-			if n.log != nil {
-				n.log.Error("IBFT propose failed", "err", err)
-			}
-			http.Error(w, "ibft propose failed", http.StatusInternalServerError)
-			return
-		}
-		n.appendTxExecutionStep("ibft_propose", map[string]string{"proposal_hash": h}, nil)
-		// respond Accepted while IBFT runs; clients can poll /v1/tx/status
+		mainFlow := n.finalizeTransactionState(h, data, pendingKey, pendingType)
+		go n.handleBesuExecution(data, true, h, data, pendingKey, pendingType, mainFlow)
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 	// Not at threshold yet
 	w.WriteHeader(http.StatusAccepted)
-}
-
-// handleVote processes a leader's vote request; verifies the signature and returns affirmative on success.
-func (n *Node) handleVote(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	// Peer auth
-	n.mu.RLock()
-	token := n.peerToken
-	n.mu.RUnlock()
-	if token != "" {
-		if ah := r.Header.Get("Authorization"); ah != "Bearer "+token {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
-	if ct := r.Header.Get("Content-Type"); ct != "" && ct != "application/json" {
-		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	var req voteReq
-	if err := dec.Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	// Verify leader signature over canonical bytes
-	b := canonicalVoteBytes(req.Data, req.Items, req.LeaderWallet, req.LeaderProof, req.LeaderProofSig)
-	ok, err := eth.VerifyPersonal(b, req.LeaderSig, req.LeaderWallet)
-	if err != nil || !ok {
-		http.Error(w, "invalid leader signature", http.StatusBadRequest)
-		return
-	}
-	if err := n.verifyProof(r.Context(), req.LeaderWallet, req.LeaderProof, req.LeaderProofSig); err != nil {
-		http.Error(w, "invalid leader proof", http.StatusBadRequest)
-		return
-	}
-	for _, item := range req.Items {
-		if err := n.verifyProof(r.Context(), item.Wallet, item.Proof, item.ProofSig); err != nil {
-			http.Error(w, "invalid participant proof", http.StatusBadRequest)
-			return
-		}
-	}
-	// Vote affirmative
-	w.WriteHeader(http.StatusOK)
 }
 
 func (n *Node) prepareProof(ctx context.Context, wallet string) (merkleProofPayload, string, error) {
@@ -1485,6 +1185,7 @@ func (n *Node) buildLeaderCollectEntry(ctx context.Context, data string) (collec
 	n.mu.RLock()
 	keyHex := n.privKeyHex
 	flow := protocol.CloneExecutionFlow(n.txExecutionFlow)
+	txType := n.txPendingType
 	n.mu.RUnlock()
 	if keyHex == "" {
 		return collectReq{}, errors.New("leader missing private key")
@@ -1502,53 +1203,7 @@ func (n *Node) buildLeaderCollectEntry(ctx context.Context, data string) (collec
 		return collectReq{}, err
 	}
 	participant := participantStorageKey(n.id, addr)
-	return collectReq{Data: data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig, ParticipantID: participant, ExecutionFlow: flow}, nil
-}
-
-func (n *Node) appendTxSubFlow(source string, steps []protocol.ExecutionStep) {
-	if len(steps) == 0 {
-		return
-	}
-	label := normalizeParticipantDisplay(source)
-	if label == "" {
-		return
-	}
-	clone := protocol.CloneExecutionFlow(steps)
-	n.mu.Lock()
-	if n.txSubFlows == nil {
-		n.txSubFlows = make(map[string][]protocol.ExecutionStep)
-	}
-	n.txSubFlows[label] = append(n.txSubFlows[label], clone...)
-	n.mu.Unlock()
-}
-
-func (n *Node) appendTxCommitFlow(source string, step protocol.ExecutionStep) {
-	label := normalizeParticipantDisplay(source)
-	if label == "" {
-		return
-	}
-	n.mu.Lock()
-	if n.txCommitFlows == nil {
-		n.txCommitFlows = make(map[string][]protocol.ExecutionStep)
-	}
-	n.txCommitFlows[label] = append(n.txCommitFlows[label], step)
-	n.mu.Unlock()
-}
-
-func (n *Node) recordConsensusTrace(msg ibft.Message) {
-	if !n.isLeader {
-		return
-	}
-	switch msg.Type {
-	case ibft.Commit:
-		meta := map[string]string{
-			"sender":        msg.From,
-			"round":         strconv.FormatUint(uint64(msg.Round), 10),
-			"proposal_hash": msg.Value,
-		}
-		step := protocol.NewExecutionStep("ibft_node", msg.From, "commit_ack", meta)
-		n.appendTxCommitFlow(msg.From, step)
-	}
+	return collectReq{Data: data, Wallet: addr, Sig: sigHex, Proof: proof, ProofSig: proofSig, Type: txType, ParticipantID: participant, ExecutionFlow: flow}, nil
 }
 
 func (n *Node) buildCollectAggregation(count, threshold int, items []collectReq) *protocol.ExecutionAggregation {
@@ -1556,7 +1211,6 @@ func (n *Node) buildCollectAggregation(count, threshold int, items []collectReq)
 		return nil
 	}
 	n.mu.RLock()
-	subFlows := cloneSubFlowMap(n.txSubFlows)
 	leaderLabel := normalizeParticipantDisplay(n.id)
 	n.mu.RUnlock()
 	participants := make([]protocol.ExecutionAggregationParticipant, 0, len(items))
@@ -1570,20 +1224,22 @@ func (n *Node) buildCollectAggregation(count, threshold int, items []collectReq)
 		if seen[normalized] {
 			continue
 		}
-		events := protocol.CloneExecutionFlow(subFlows[normalized])
 		metadata := map[string]string{
 			"wallet":    strings.ToLower(it.Wallet),
 			"signature": it.Sig,
+		}
+		if it.Type != "" {
+			metadata["type"] = it.Type
 		}
 		if root := trimHexPrefix(it.Proof.Root); root != "" {
 			metadata["proof_root"] = root
 		}
 		participant := protocol.ExecutionAggregationParticipant{
+			Type:       protocol.ExecutionAggregationParticipantType,
 			NodeID:     label,
 			Role:       participantRole(normalized, leaderLabel),
-			FlowDigest: flowDigest(events),
+			FlowDigest: "",
 			Metadata:   metadata,
-			Events:     events,
 		}
 		participants = append(participants, participant)
 		seen[normalized] = true
@@ -1595,6 +1251,7 @@ func (n *Node) buildCollectAggregation(count, threshold int, items []collectReq)
 		return participants[i].NodeID < participants[j].NodeID
 	})
 	return &protocol.ExecutionAggregation{
+		Type:           protocol.ExecutionAggregationType,
 		Kind:           "collect_threshold",
 		QuorumAchieved: count,
 		QuorumRequired: threshold,
@@ -1603,64 +1260,41 @@ func (n *Node) buildCollectAggregation(count, threshold int, items []collectReq)
 	}
 }
 
-func (n *Node) buildCommitAggregationLocked(proposalHash string) *protocol.ExecutionAggregation {
-	total := n.e.ValidatorCount()
-	round := n.e.Round()
-	leaderLabel := normalizeParticipantDisplay(n.id)
-	participants := make([]protocol.ExecutionAggregationParticipant, 0, len(n.txCommitFlows)+1)
-	keys := make([]string, 0, len(n.txCommitFlows))
-	for k := range n.txCommitFlows {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		events := protocol.CloneExecutionFlow(n.txCommitFlows[key])
-		participants = append(participants, protocol.ExecutionAggregationParticipant{
-			NodeID:     key,
-			Role:       participantRole(key, leaderLabel),
-			FlowDigest: flowDigest(events),
-			Events:     events,
-		})
-	}
-	if !containsParticipant(keys, leaderLabel) {
-		leaderStep := protocol.NewExecutionStep("ibft_node", n.id, "commit_self", map[string]string{
-			"proposal_hash": proposalHash,
-			"round":         strconv.FormatUint(uint64(round), 10),
-		})
-		participants = append(participants, protocol.ExecutionAggregationParticipant{
-			NodeID:     leaderLabel,
-			Role:       "leader",
-			FlowDigest: flowDigest([]protocol.ExecutionStep{leaderStep}),
-			Events:     []protocol.ExecutionStep{leaderStep},
-		})
-	}
-	if len(participants) == 0 {
-		return nil
-	}
-	sort.Slice(participants, func(i, j int) bool {
-		return participants[i].NodeID < participants[j].NodeID
-	})
-	agg := &protocol.ExecutionAggregation{
-		Kind:           "ibft_commit",
-		QuorumAchieved: len(participants),
-		QuorumRequired: (2*total)/3 + 1,
-		ReceivedAt:     time.Now().UTC(),
-		Participants:   participants,
-		Metadata: map[string]string{
-			"proposal_hash": proposalHash,
-			"round":         strconv.FormatUint(uint64(round), 10),
-		},
-	}
-	return agg
+func (n *Node) clearFinalizingFlag() {
+	n.mu.Lock()
+	n.txFinalizing = false
+	n.mu.Unlock()
 }
 
-func containsParticipant(list []string, target string) bool {
-	for _, v := range list {
-		if v == target {
-			return true
-		}
+func (n *Node) finalizeTransactionState(proposalHash, txData, txKey, txType string) []protocol.ExecutionStep {
+	meta := map[string]string{
+		"proposal_hash": proposalHash,
 	}
-	return false
+	if txKey != "" {
+		meta["key"] = txKey
+	}
+	if txType != "" {
+		meta["type"] = txType
+	}
+	n.appendTxExecutionStep("transaction_finalize", meta, nil)
+
+	n.mu.Lock()
+	mainFlow := protocol.CloneExecutionFlow(n.txExecutionFlow)
+	n.lastTxLaunchedAt = time.Now()
+	n.lastTxLastData = txData
+	n.lastTxKey = txKey
+	n.lastTxType = txType
+	n.txSigs = make(map[string]string)
+	n.txItems = make(map[string]collectReq)
+	n.txPendingData = ""
+	n.txPendingKey = ""
+	n.txPendingType = ""
+	n.txExecutionFlow = nil
+	n.txFinalizing = false
+	n.txLeaderPrepared = false
+	n.mu.Unlock()
+
+	return mainFlow
 }
 
 func participantRole(label, leaderLabel string) string {
@@ -1668,18 +1302,6 @@ func participantRole(label, leaderLabel string) string {
 		return "leader"
 	}
 	return "follower"
-}
-
-func flowDigest(steps []protocol.ExecutionStep) string {
-	if len(steps) == 0 {
-		return ""
-	}
-	b, err := json.Marshal(steps)
-	if err != nil {
-		return ""
-	}
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
 }
 
 func (n *Node) appendTxExecutionStep(role string, metadata map[string]string, aggregation *protocol.ExecutionAggregation) {
@@ -1692,41 +1314,11 @@ func (n *Node) appendTxExecutionStep(role string, metadata map[string]string, ag
 	n.mu.Unlock()
 }
 
-func cloneSubFlowMap(src map[string][]protocol.ExecutionStep) map[string][]protocol.ExecutionStep {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make(map[string][]protocol.ExecutionStep, len(src))
-	for k, v := range src {
-		dst[k] = protocol.CloneExecutionFlow(v)
-	}
-	return dst
-}
-
-func buildExecutionFlowPayload(main []protocol.ExecutionStep, subs map[string][]protocol.ExecutionStep) protocol.ExecutionFlow {
-	flow := protocol.ExecutionFlow{
+func buildExecutionFlowPayload(main []protocol.ExecutionStep) protocol.ExecutionFlow {
+	return protocol.ExecutionFlow{
+		Type:  protocol.ExecutionFlowType,
 		Steps: protocol.CloneExecutionFlow(main),
 	}
-	if len(subs) == 0 {
-		return flow
-	}
-	keys := make([]string, 0, len(subs))
-	for k := range subs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	subflows := make([]protocol.ExecutionSubflow, 0, len(keys))
-	for _, k := range keys {
-		steps := protocol.CloneExecutionFlow(subs[k])
-		if len(steps) == 0 {
-			continue
-		}
-		subflows = append(subflows, protocol.ExecutionSubflow{Source: k, Steps: steps})
-	}
-	if len(subflows) > 0 {
-		flow.Subflows = subflows
-	}
-	return flow
 }
 
 func participantStorageKey(participantID, wallet string) string {

@@ -19,20 +19,23 @@ import (
 )
 
 type executeRequest struct {
-	Data          string                      `json:"data"`
-	Key           string                      `json:"key"`
-	ExecutionFlow []protocol.ExecutionStep    `json:"execution_flow"`
+	Data          string                   `json:"data"`
+	Key           string                   `json:"key"`
+	Timestamp     string                   `json:"timestamp,omitempty"`
+	Type          string                   `json:"type,omitempty"`
+	ExecutionFlow []protocol.ExecutionStep `json:"execution_flow"`
 }
 
 type executeResponse struct {
-	NodeID        string                   `json:"node_id"`
-	Data          string                   `json:"data"`
-	ProposalHash  string                   `json:"proposal_hash"`
-	Key           string                   `json:"key"`
-	Status        string                   `json:"status"`
-	TxHash        string                   `json:"tx_hash"`
-	Error         string                   `json:"error"`
-	Timestamp     string                   `json:"timestamp"`
+	NodeID        string                  `json:"node_id"`
+	Data          string                  `json:"data"`
+	ProposalHash  string                  `json:"proposal_hash"`
+	Key           string                  `json:"key"`
+	Status        string                  `json:"status"`
+	TxHash        string                  `json:"tx_hash"`
+	Error         string                  `json:"error"`
+	Timestamp     string                  `json:"timestamp"`
+	Type          string                  `json:"type"`
 	ExecutionFlow *protocol.ExecutionFlow `json:"execution_flow"`
 }
 
@@ -46,6 +49,7 @@ func main() {
 		responseTopic string
 		requestData   string
 		key           string
+		requestType   string
 		timeoutFlag   time.Duration
 	)
 
@@ -54,6 +58,7 @@ func main() {
 	flag.StringVar(&responseTopic, "response-topic", "execute_transaction_response", "Kafka topic to read execute responses")
 	flag.StringVar(&requestData, "data", "", "Raw data payload to execute")
 	flag.StringVar(&key, "key", "", "Optional key identifier (defaults to random UUID)")
+	flag.StringVar(&requestType, "type", "", "Optional logical transaction type")
 	flag.DurationVar(&timeoutFlag, "timeout", 30*time.Second, "Time to wait for the blockchain response")
 	flag.Parse()
 
@@ -80,9 +85,10 @@ func main() {
 	if key == "" {
 		key = uuid.NewString()
 	}
+	requestType = strings.TrimSpace(requestType)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	logger.Info("publishing execute transaction", "key", key, "brokers", strings.Join(brokers, ","))
+	logger.Info("publishing execute transaction", "key", key, "type", requestType, "brokers", strings.Join(brokers, ","))
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:  brokers,
@@ -104,7 +110,13 @@ func main() {
 	}
 	defer writer.Close()
 
-	payload := executeRequest{Data: requestData, Key: key, ExecutionFlow: []protocol.ExecutionStep{}}
+	payload := executeRequest{
+		Data:          requestData,
+		Key:           key,
+		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
+		Type:          requestType,
+		ExecutionFlow: []protocol.ExecutionStep{},
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to marshal payload: %v\n", err)
@@ -158,7 +170,7 @@ func main() {
 
 		pretty, _ := json.MarshalIndent(resp, "", "  ")
 		fmt.Println(string(pretty))
-		logger.Info("response received", "status", resp.Status, "tx_hash", resp.TxHash)
+		logger.Info("response received", "status", resp.Status, "tx_hash", resp.TxHash, "type", resp.Type)
 		return
 	}
 }

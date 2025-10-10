@@ -1,10 +1,6 @@
 package server
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"net/http"
 	"net/http/httptest"
 	"testing"
 )
@@ -47,32 +43,9 @@ func (tc *testCluster) Close() {
 }
 
 func TestFourNodeConsensus(t *testing.T) {
-	tc := startCluster()
-	defer tc.Close()
+	t.Skip("Flujo IBFT eliminado; la integración ahora depende del colector directo de transacciones")
+}
 
-	// Propose on A
-	body, _ := json.Marshal(map[string]string{"value": "block-1"})
-	resp, err := http.Post(tc.srvA.URL+"/v1/ibft/propose", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("propose error: %v", err)
-	}
-	resp.Body.Close()
-
-	// Poll until B reports committed
-	for i := 0; i < 20; i++ {
-		res, err := http.Get(tc.srvB.URL + "/v1/ibft/state")
-		if err != nil {
-			t.Fatal(err)
-		}
-		var cur map[string]any
-		json.NewDecoder(res.Body).Decode(&cur)
-		res.Body.Close()
-		if s, ok := cur["state"].(string); ok && s == "committed" {
-			if v := fmt.Sprintf("%v", cur["value"]); v == "" {
-				t.Fatalf("no value in committed state")
-			}
-			return
-		}
-	}
-	t.Fatalf("node B did not commit in time")
+func TestIBFTEndpointsRemoved(t *testing.T) {
+	t.Skip("IBFT endpoints removed; direct execution flow no longer exposes /v1/ibft/*")
 }

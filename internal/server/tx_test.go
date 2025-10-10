@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cgomezcal/ds-ms-ibfs/internal/eth"
 )
@@ -17,12 +19,11 @@ func TestTxAggregationLeaderQuorum(t *testing.T) {
 	leader := NewNode("A", ":0", nil)
 	leader.SetAuthToken("t")
 	leader.SetNetwork(nil, []string{"A", "B", "C", "D"})
-	leader.SetLeader("http://leader", true)
 	tsL := httptest.NewServer(leader.mux)
 	defer tsL.Close()
 	leader.SetLeader(tsL.URL, true)
 
-	data := "hello"
+	data := "hello-quorum"
 	// three distinct dev keys
 	keys := []string{
 		"0xb71c71a67e1177ad4e901695e1b4b9c2d68e8f0e2b8a9d17a2a4d4a8e6f5f2f0",
@@ -30,6 +31,16 @@ func TestTxAggregationLeaderQuorum(t *testing.T) {
 		"0x8f2a559490b8d6e3d2b1016da0fbdc3f5b6b6f9bcd3d2e2c2a2b1a1a0a9a8a7a",
 	}
 	leader.SetPrivateKey(keys[0])
+
+	var once sync.Once
+	done := make(chan struct{})
+	leader.SetBesuExecutor(func(msg string) (string, error) {
+		if msg != data {
+			t.Errorf("expected message %q, got %q", data, msg)
+		}
+		once.Do(func() { close(done) })
+		return "0xdeadbeef", nil
+	})
 
 	type collect struct {
 		Data          string             `json:"data"`
@@ -39,10 +50,12 @@ func TestTxAggregationLeaderQuorum(t *testing.T) {
 		ProofSig      string             `json:"proof_sig"`
 		ParticipantID string             `json:"participant_id"`
 	}
+
 	type signer struct {
-		collect
+		payload collect
 		privHex string
 	}
+
 	signers := make([]signer, 0, len(keys))
 	wallets := make([]string, 0, len(keys))
 	for idx, k := range keys {
@@ -54,43 +67,69 @@ func TestTxAggregationLeaderQuorum(t *testing.T) {
 		if err != nil {
 			t.Fatalf("sign: %v", err)
 		}
-		participantID := string(rune('A' + idx))
-		signers = append(signers, signer{collect: collect{Data: data, Wallet: addr, Sig: sig, ParticipantID: participantID}, privHex: k})
+		signers = append(signers, signer{
+			payload: collect{
+				Data:          data,
+				Wallet:        addr,
+				Sig:           sig,
+				ParticipantID: string(rune('A' + idx)),
+			},
+			privHex: k,
+		})
 		wallets = append(wallets, addr)
 	}
+
 	stub := newMTMStub(t, wallets)
 	defer stub.Close()
 	leader.SetMTMBaseURL(stub.URL())
+
 	for i := range signers {
-		proof := stub.Proof(signers[i].Wallet)
+		proof := stub.Proof(signers[i].payload.Wallet)
 		priv, err := eth.ParsePrivateKey(signers[i].privHex)
 		if err != nil {
 			t.Fatalf("parse key for proof: %v", err)
 		}
-		sigProof, _, err := eth.SignPersonal(canonicalProofBytes(signers[i].Wallet, proof), priv)
+		sigProof, _, err := eth.SignPersonal(canonicalProofBytes(signers[i].payload.Wallet, proof), priv)
 		if err != nil {
 			t.Fatalf("sign proof: %v", err)
 		}
-		signers[i].Proof = proof
-		signers[i].ProofSig = sigProof
+		signers[i].payload.Proof = proof
+		signers[i].payload.ProofSig = sigProof
 	}
-	// Primeras dos 202, la tercera ahora es 202 (IBFT corre asíncronamente)
-	for i, pl := range signers {
-		b, _ := json.Marshal(pl.collect)
-		req, _ := http.NewRequest(http.MethodPost, tsL.URL+"/v1/tx/collect", bytes.NewReader(b))
+	// Las primeras dos regresan 202; la tercera alcanza el umbral y dispara la ejecución asíncrona
+	for idx, s := range signers {
+		body, _ := json.Marshal(s.payload)
+		req, _ := http.NewRequest(http.MethodPost, tsL.URL+"/v1/tx/collect", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer t")
 		res, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if i < 2 && res.StatusCode != http.StatusAccepted {
-			t.Fatalf("expected 202 on %d, got %d", i, res.StatusCode)
+		if idx < len(signers)-1 && res.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected 202 on %d, got %d", idx, res.StatusCode)
 		}
-		if i == 2 && res.StatusCode != http.StatusAccepted {
-			t.Fatalf("expected 202 on third (IBFT), got %d", res.StatusCode)
+		if idx == len(signers)-1 && res.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected 202 on final collect, got %d", res.StatusCode)
 		}
 		res.Body.Close()
+	}
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected Besu execution after quorum")
+	}
+
+	if pending, count := leader.txDebug(); pending != "" || count != 0 {
+		t.Fatalf("expected aggregation cleared, got data=%q count=%d", pending, count)
+	}
+
+	leader.mu.RLock()
+	lastData := leader.lastTxLastData
+	leader.mu.RUnlock()
+	if lastData != data {
+		t.Fatalf("expected last transaction data %q, got %q", data, lastData)
 	}
 }
 
@@ -98,7 +137,6 @@ func TestTxAggregationSameWalletParticipants(t *testing.T) {
 	leader := NewNode("A", ":0", nil)
 	leader.SetAuthToken("t")
 	leader.SetNetwork(nil, []string{"A", "B", "C"})
-	leader.SetLeader("http://leader", true)
 	ts := httptest.NewServer(leader.mux)
 	defer ts.Close()
 	leader.SetLeader(ts.URL, true)
@@ -116,6 +154,13 @@ func TestTxAggregationSameWalletParticipants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
+
+	var once sync.Once
+	done := make(chan struct{})
+	leader.SetBesuExecutor(func(msg string) (string, error) {
+		once.Do(func() { close(done) })
+		return "0xabc123", nil
+	})
 
 	stub := newMTMStub(t, []string{wallet})
 	defer stub.Close()
@@ -138,7 +183,14 @@ func TestTxAggregationSameWalletParticipants(t *testing.T) {
 
 	participants := []string{"A", "B", "C"}
 	for idx, participant := range participants {
-		payload := collect{Data: data, Wallet: wallet, Sig: sig, Proof: proof, ProofSig: proofSig, ParticipantID: participant}
+		payload := collect{
+			Data:          data,
+			Wallet:        wallet,
+			Sig:           sig,
+			Proof:         proof,
+			ProofSig:      proofSig,
+			ParticipantID: participant,
+		}
 		body, _ := json.Marshal(payload)
 		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/tx/collect", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -156,6 +208,16 @@ func TestTxAggregationSameWalletParticipants(t *testing.T) {
 				t.Fatalf("expected %d collected entries, got %d", idx+1, count)
 			}
 		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected execution after threshold with shared wallet")
+	}
+
+	if pending, count := leader.txDebug(); pending != "" || count != 0 {
+		t.Fatalf("expected cleared aggregation, got data=%q count=%d", pending, count)
 	}
 }
 
@@ -218,7 +280,7 @@ func TestExecuteLeaderCollectErrorPropagates(t *testing.T) {
 	leader.SetMTMBaseURL(mtm.URL)
 
 	var (
-		collectHits  int32
+		collectHits   int32
 		collectStatus int32
 	)
 	collectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -238,7 +300,7 @@ func TestExecuteLeaderCollectErrorPropagates(t *testing.T) {
 	ts := httptest.NewServer(leader.mux)
 	defer ts.Close()
 
-	reqPayload := executeReq{Data: "demo", Key: "k"}
+	reqPayload := executeReq{Data: "demo", Key: "k", Type: "unit-test"}
 	body, _ := json.Marshal(reqPayload)
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/tx/execute-transaction", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -260,5 +322,11 @@ func TestExecuteLeaderCollectErrorPropagates(t *testing.T) {
 	// asegurar que el flujo no queda registrado tras el fallo
 	if data, count := leader.txDebug(); data != "" || count != 0 {
 		t.Fatalf("expected no pending aggregation, got data=%q count=%d", data, count)
+	}
+	leader.mu.RLock()
+	pendingType := leader.txPendingType
+	leader.mu.RUnlock()
+	if pendingType != "" {
+		t.Fatalf("expected no pending type, got %q", pendingType)
 	}
 }
